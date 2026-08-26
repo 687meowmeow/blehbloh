@@ -100,62 +100,71 @@ blehbloh/
 
 ## Changelog
 
-### v5 (this update — root-cause fixes for images + layout + lichess + replit)
-Diagnosed empirically by fetching live lichess.org and replit.com HTML and
-running the actual rewriter against them. Found 7 specific bugs:
+### v6 (this update — JS AST rewriter + location emulation)
+This is the big architectural fix that production proxies (Ultraviolet,
+Corrosion) have and we didn't. Replit was uninteractable and lichess's
+center panel was missing because the JS AST rewriter was missing.
 
-- **Double-prefix bug on cross-origin absolute URLs (the Replit killer).**
-  `<script src="https://cdn.replit.com/_next/foo.js">` was rewritten to
-  `/p/<encoded-replit>/p/<encoded-cdn>/_next/foo.js` (double-prefixed).
-  The browser requested that, the proxy stripped the outer prefix, forwarded
-  `replit.com/p/<encoded-cdn>/_next/foo.js` → 404. EVERY Replit JS chunk
-  failed. Fixed: skip-check now recognizes any `/p/<encoded>/` prefix, not
-  just the target's own.
-- **`<meta http-equiv="Content-Security-Policy">` not stripped (the Lichess
-  killer).** Lichess ships CSP as a meta tag (not a header). My rewriter
-  rewrote the `wss://socketN.lichess.org` entries to `wss://localhost/p/...`
-  but CSP path-matching requires the source's path to end with `/`. The
-  rewritten sources don't, so the actual WS URL was rejected. Lobby never
-  populated. Fixed: meta CSP tags are now stripped entirely (the response
-  CSP header was already stripped).
-- **CSS `url('/foo')` never rewritten.** Affected inline `<style>` and
-  external `.css` files. `@font-face{src:url('/fonts/x.woff2')}` 404'd
-  against the proxy host. Fixed: new `rewriteCssUrls` for text/css content
-  + inline `<style>` blocks. Skips `data:`/`blob:`/`#`/`mailto:`.
-- **Cross-apex origins not proxied.** `lichess1.org` (lichess's asset CDN,
-  separate eTLD+1), `cdn.replit.com`, `reachability.replit.app`,
-  `identitytoolkit.googleapis.com` (Firebase) were all left untouched
-  because the rewriter only matched the target's own eTLD+1. Result: the
-  browser made direct cross-origin requests to these origins, leaking the
-  user's real IP and failing CORS. Fixed: the rewriter now proxies ALL
-  absolute URLs through `/p/<encoded-of-that-origin>/`. Each origin gets
-  its own encoded prefix.
-- **`srcset` not in `URL_ATTR_RE`.** Initial-HTML `srcset` was never
-  rewritten server-side. Fixed: separate `SRCSET_ATTR_RE` handles
-  `srcset`/`imagesrcset`/`data-srcset`.
-- **`rewriteSrcset` destroyed Cloudflare URLs by splitting on `,`.**
-  Cloudflare's `cdn-cgi/image` URLs contain un-encoded commas
-  (`/cdn-cgi/image/width=128,quality=80,format=auto/...`). The naive
-  `value.split(',')` fragmented them. Fixed: descriptor-aware scanner
-  that only treats a comma as an entry separator if the next non-space
-  token looks like a URL start.
-- **Absolute paths in HTML attrs not rewritten for `<base>` tag limitation.**
-  Per RFC 3986, `<base href="/p/<encoded>/">` does NOT affect absolute
-  paths (`/foo`). They were silently 404ing against the proxy host. Already
-  fixed in v4, now applied more robustly.
+- **JS AST rewriter** (`lib/jsRewrite.js`): parses every JS bundle with
+  acorn, walks the AST, and rewrites reads/writes of `location`,
+  `parent`, `top` to go through `$proxyGet$` / `$proxySet$` globals
+  that return an emulated location object. `location.href` becomes
+  `$proxyGet$(window, "location").href`. `window.location = "/foo"`
+  becomes `$proxySet$(window, "location", "/foo", "=")`. Object keys,
+  function params, var declarations, and member accesses on non-
+  window objects are correctly NOT rewritten. Function/arrow/destructuring
+  param shadowing is handled by a scope-tracking first pass.
+- **Location emulation** (in `public/proxy-client.js`): a plain
+  object with `href`/`origin`/`pathname`/etc. getters that return the
+  TARGET's URL parts (parsed by unwrapping the proxy prefix from the
+  real `location.href`). Setters navigate via `window.location.href =
+  rewriteUrl(...)`. This is what `$proxyGet$(window, "location")`
+  returns to the page's JS.
+- **`$proxyGet$`/`$proxySet$`/`$proxyCall$m` globals** installed on
+  `window`. `$proxyGet$(window, "location")` returns the location
+  emulation; `$proxySet$(window, "location", "url", "=")` navigates via
+  the proxy; other reads/writes fall through to the real property.
+- **`history.pushState`/`replaceState` now call `updateLocationEmulation`
+  after** so that subsequent reads of `location.pathname` reflect the
+  new path. SPA routers (Next.js `useRouter`, scalajs-react) read
+  `location.pathname` to determine which route to render.
+- **`popstate` listener** updates the emulation on back/forward.
+- **`document.URL` / `documentURI` overrides** return the target's URL
+  (was returning the proxy URL).
+- **`Node.prototype.baseURI` override** returns the target origin.
+- **`window.origin` override** (window.origin IS configurable, unlike
+  window.location).
+- **Anchor click handler removed.** The capture-phase click listener
+  was desyncing React 18's synthetic event system (it walks the DOM
+  during the click handler and gets confused if attributes change
+  mid-event). Replaced with `HTMLAnchorElement.prototype.href` descriptor
+  override + sidecar attribute pattern (`__proxy-href`): when JS sets
+  `el.href = "/foo"`, we stash `/foo` under `__proxy-href` and set the
+  actual href to `rewriteUrl("/foo")`. `getAttribute('href')` returns
+  the sidecar; the browser navigates the proxied URL. This is the
+  pattern Corrosion uses.
+- **Inline `<script>` blocks** now get the JS AST rewriter applied
+  (was only being applied to external .js files).
+- **Absolute https?:// URLs in inline scripts are NO LONGER rewritten**
+  (only absolute paths /foo are). This preserves origin string
+  comparisons like `if (location.origin === "https://replit.com")`
+  — both sides now read the same target origin. The client-side
+  `fetch()`/`XHR` patches catch URLs used as fetch arguments at runtime.
 
-Additional v5 improvements:
-- Expanded `ATTRIBS` table in the client-side MutationObserver: added
-  `ping`, `imagesrcset`, `imagesizes`, `formaction`, `data-bg`,
-  `data-original`, `data-lazy`, `data-lazy-src`, `data-srcset`,
-  `data-poster`, `data-share-url`, `data-download-url`, SVG `<use>`,
-  SVG `<image>`, `xlink:href`, `track`.
-- Initial-document rewrite now runs SYNCHRONOUSLY at script-injection
-  time (was on DOMContentLoaded, which was too late for `<head>` elements
-  like `<link>` / `<meta>`).
-- Inline `style="url(...)"` attributes now rewritten.
-- Meta refresh (`<meta http-equiv="refresh" content="0; url=/foo">`)
-  now handled.
+### v5
+- Double-prefix bug on cross-origin absolute URLs (the Replit killer):
+  `<script src="https://cdn.replit.com/_next/foo.js">` was getting
+  `/p/<enc-replit>/p/<enc-cdn>/_next/foo.js`. Fixed.
+- `<meta http-equiv="Content-Security-Policy">` stripped (the Lichess
+  killer): CSP path-matching rejected the proxied WS URLs.
+- CSS `url('/foo')` rewriter added for text/css + inline `<style>`.
+- Cross-apex origins proxied: lichess1.org, cdn.replit.com,
+  identitytoolkit.googleapis.com (Firebase) all get their own encoded
+  prefix. Replaces the old "only match target eTLD+1" logic.
+- srcset/imagesrcset handled separately with descriptor-aware splitter
+  (Cloudflare's cdn-cgi/image URLs contain commas).
+- SVG `<use>`/`<image>`/`xlink:href`, meta refresh, `data-bg`/
+  `data-original`/`data-lazy-src`, inline `style="url(...)"` attributes.
 
 ### v4
 - Streaming responses no longer buffered (custom `onProxyRes`).

@@ -21,6 +21,7 @@ const zlib = require('zlib');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, rewriteCssUrls, rewriteSrcsetValue, injectIntoHtml } = require('./lib/rewrite');
+const { rewriteJs } = require('./lib/jsRewrite');
 const { buildOutboundHeaders, USER_AGENT } = require('./lib/fingerprint');
 const { gateFromEnv } = require('./lib/throttle');
 const { CookieJar } = require('./lib/cookieJar');
@@ -230,16 +231,43 @@ function makeOnProxyRes(targetUrl, encoded, prefix) {
           body = rewriteCssUrls(body, targetUrl, encoded);
         } else if (isHtml) {
           // For HTML, rewrite URLs everywhere (HTML attributes, inline
-          // CSS, JS string literals) and inject the <base> + script.
+          // CSS, absolute-path URLs in inline scripts) and inject the
+          // <base> + script. Then run the JS AST rewriter on inline
+          // <script> blocks (location/parent/top reads/writes).
           body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
           body = injectIntoHtml(body, encoded, targetUrl.origin);
+          // Run JS AST rewriter on inline <script> blocks.
+          body = body.replace(/<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi, (m, attrs, content) => {
+            // Skip if the script has a src= attribute (external script).
+            if (/\bsrc\s*=/i.test(attrs || '')) return m;
+            // Skip non-JS scripts.
+            const typeMatch = (attrs || '').match(/type\s*=\s*["']([^"']*)["']/i);
+            if (typeMatch) {
+              const t = typeMatch[1].toLowerCase();
+              if (t && t !== 'text/javascript' && t !== 'application/javascript' && t !== 'module' && t !== 'application/ecmascript' && t !== 'text/ecmascript') {
+                return m;
+              }
+            }
+            const rewritten = rewriteJs(content);
+            if (rewritten && rewritten !== content) {
+              return `<script${attrs || ''}>${rewritten}</script>`;
+            }
+            return m;
+          });
         } else if (isJs) {
-          // For JS, rewrite absolute + ws:// URLs (already done by
-          // rewriteTextBody) but DON'T apply URL_ATTR_RE (which is
-          // HTML-attribute-only). We use rewriteTextBody for the absolute
-          // URL substitution only; URL_ATTR_RE only matches HTML attrs
-          // so it's harmless on JS. Inline <style> regex also harmless.
-          body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
+          // For JS, run ONLY the AST rewriter (rewrites location/parent/top
+          // reads/writes to go through $proxyGet$/$proxySet$ globals). We
+          // do NOT apply rewriteTextBody (which would rewrite absolute URLs
+          // in JS strings — that breaks origin comparisons like
+          // `if (location.origin === "https://replit.com")` because both
+          // sides would be different).
+          // For URLs in JS strings used as fetch/XHR/img.src arguments,
+          // the client-side fetch/XHR/MutationObserver patches catch them
+          // at runtime.
+          const astRewritten = rewriteJs(body);
+          if (astRewritten && astRewritten !== body) {
+            body = astRewritten;
+          }
         } else {
           // JSON / other text: rewrite absolute URLs only.
           body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);

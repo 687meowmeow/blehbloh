@@ -51,6 +51,203 @@
     catch { return ''; }
   }
 
+  // Decode a base64url-encoded origin.
+  function decodeOrigin(enc) {
+    try {
+      const b64 = enc.replace(/-/g, '+').replace(/_/g, '/');
+      const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+      return atob(padded);
+    } catch { return ''; }
+  }
+
+  // --- URL unwrap -----------------------------------------------------
+  // Given a proxied URL (e.g. /p/<encoded>/<path>), return the original URL.
+  // Returns null if `url` is not a proxied URL.
+  function unwrapUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+    try {
+      const u = new URL(url, location.href);
+      const m = u.pathname.match(/^\/p\/([^/]+)(.*)$/);
+      if (!m) return null;
+      const origin = decodeOrigin(m[1]);
+      if (!origin) return null;
+      return origin + m[2] + (u.search || '') + (u.hash || '');
+    } catch { return null; }
+  }
+
+  // --- Location emulation --------------------------------------------
+  // `window.location` is [Unforgeable] — we can't redefine it. The JS AST
+  // rewriter (on the server) rewrites reads of `location` to call
+  // $proxyGet$(window, "location") which returns THIS emulation. The
+  // emulation's getters return the TARGET's URL parts (parsed by unwrapping
+  // the proxy prefix), and the setters do `window.location.href =
+  // proxyPrefix(rewrittenUrl)` to navigate through the proxy.
+  function createLocationEmulation() {
+    // Parse the current proxy URL to get the target URL.
+    const proxyUrl = new URL(location.href);
+    const m = proxyUrl.pathname.match(/^\/p\/([^/]+)(.*)$/);
+    if (!m) return null;
+    const origin = decodeOrigin(m[1]);
+    if (!origin) return null;
+    const path = m[2] || '/';
+    const targetHref = origin + path + (proxyUrl.search || '') + (proxyUrl.hash || '');
+    let _url;
+    try { _url = new URL(targetHref); }
+    catch { return null; }
+
+    const emu = {};
+    emu._url = _url; // exposed so updateLocationEmulation can replace it
+    const props = ['hash', 'host', 'hostname', 'href', 'pathname', 'port', 'protocol', 'search', 'origin'];
+    for (const p of props) {
+      Object.defineProperty(emu, p, {
+        get() { return emu._url[p]; },
+        set(val) {
+          if (p === 'origin') return; // origin is read-only
+          if (p === 'href') {
+            // Navigate through the proxy.
+            try {
+              const newUrl = new URL(val, emu._url);
+              window.location.href = rewriteUrl(newUrl.href);
+            } catch (e) {}
+            return;
+          }
+          try {
+            emu._url[p] = val;
+            // Navigate through the proxy with the modified URL.
+            window.location.href = rewriteUrl(emu._url.href);
+          } catch (e) {}
+        },
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    emu.assign = function (url) {
+      try { window.location.assign(rewriteUrl(String(url))); } catch (e) {}
+    };
+    emu.replace = function (url) {
+      try { window.location.replace(rewriteUrl(String(url))); } catch (e) {}
+    };
+    emu.reload = function () { window.location.reload(); };
+    emu.toString = function () { return emu._url.href; };
+    return emu;
+  }
+
+  const LOCATION_EMU = createLocationEmulation();
+  const PARENT_EMU = LOCATION_EMU ? { location: LOCATION_EMU, postMessage: window.parent.postMessage.bind(window.parent) } : null;
+  const TOP_EMU = LOCATION_EMU ? { location: LOCATION_EMU, postMessage: window.top.postMessage.bind(window.top) } : null;
+
+  // Re-parse the proxy URL and update the location emulation's internal
+  // URL. Called after history.pushState/replaceState/popstate so that
+  // subsequent reads of `location.pathname` etc. reflect the new path.
+  function updateLocationEmulation() {
+    if (!LOCATION_EMU) return;
+    try {
+      const proxyUrl = new URL(location.href);
+      const m = proxyUrl.pathname.match(/^\/p\/([^/]+)(.*)$/);
+      if (!m) return;
+      const origin = decodeOrigin(m[1]);
+      if (!origin) return;
+      const path = m[2] || '/';
+      const targetHref = origin + path + (proxyUrl.search || '') + (proxyUrl.hash || '');
+      LOCATION_EMU._url = new URL(targetHref);
+    } catch (e) {}
+  }
+
+  // --- $proxyGet$ / $proxySet$ globals ---------------------------------
+  // The JS AST rewriter (server-side) rewrites `location` reads to call
+  // these. They return our emulation instead of the real `window.location`.
+  window.$proxyGet$ = function (obj, key) {
+    try {
+      if ((obj === window || obj === document) && key === 'location' && LOCATION_EMU) {
+        return LOCATION_EMU;
+      }
+      if (obj === window && key === 'parent' && PARENT_EMU) {
+        return PARENT_EMU;
+      }
+      if (obj === window && key === 'top' && TOP_EMU) {
+        return TOP_EMU;
+      }
+    } catch (e) {}
+    return obj[key];
+  };
+  window.$proxySet$ = function (obj, key, val, operator) {
+    try {
+      if ((obj === window || obj === document) && key === 'location' && LOCATION_EMU) {
+        // location = "..." → navigate via proxy.
+        if (val == null) {
+          // Update expression (location++ etc.) — nonsensical, ignore.
+          return;
+        }
+        LOCATION_EMU.href = String(val);
+        return;
+      }
+    } catch (e) {}
+    // Default: fall back to the actual property assignment.
+    if (operator && operator !== '=') {
+      // Compound assignment (+=, etc.). Apply via the real obj.
+      try {
+        const cur = obj[key];
+        switch (operator) {
+          case '+=': obj[key] = cur + val; break;
+          case '-=': obj[key] = cur - val; break;
+          case '*=': obj[key] = cur * val; break;
+          case '/=': obj[key] = cur / val; break;
+          case '%=': obj[key] = cur % val; break;
+          case '**=': obj[key] = cur ** val; break;
+          case '<<=': obj[key] = cur << val; break;
+          case '>>=': obj[key] = cur >> val; break;
+          case '>>>=': obj[key] = cur >>> val; break;
+          case '&=': obj[key] = cur & val; break;
+          case '^=': obj[key] = cur ^ val; break;
+          case '|=': obj[key] = cur | val; break;
+          case '&&=': obj[key] = cur && val; break;
+          case '||=': obj[key] = cur || val; break;
+          case '??=': obj[key] = cur ?? val; break;
+          case '++': obj[key] = cur + 1; break;
+          case '--': obj[key] = cur - 1; break;
+          default: obj[key] = val;
+        }
+      } catch (e) {}
+      return;
+    }
+    try { obj[key] = val; } catch (e) {}
+  };
+  window.$proxyCall$m = function (obj, key, args) {
+    try { return obj[key](...args); }
+    catch (e) { return undefined; }
+  };
+
+  // --- Document URL / baseURI / referrer overrides --------------------
+  // Sites use document.URL, document.baseURI, document.referrer to know
+  // their own URL. Override the getters to return the TARGET's URL instead
+  // of the proxy's.
+  try {
+    Object.defineProperty(document, 'URL', {
+      get() { return LOCATION_EMU ? LOCATION_EMU.href : location.href; },
+      configurable: true,
+    });
+  } catch (e) {}
+  try {
+    Object.defineProperty(document, 'documentURI', {
+      get() { return LOCATION_EMU ? LOCATION_EMU.href : location.href; },
+      configurable: true,
+    });
+  } catch (e) {}
+  try {
+    Object.defineProperty(Node.prototype, 'baseURI', {
+      get() { return TARGET_ORIGIN + '/'; },
+      configurable: true,
+    });
+  } catch (e) {}
+  // window.origin override (window.origin IS configurable, unlike
+  // window.location).
+  try {
+    Object.defineProperty(window, 'origin', {
+      get() { return TARGET_ORIGIN; },
+      configurable: true,
+    });
+  } catch (e) {}
+
   // Rewrite a single URL string to its proxied form. We rewrite ALL absolute
   // URLs (any origin) through /p/<encoded-of-that-origin>/... — not just
   // target-subdomain URLs. This is critical for sites like Replit that fan
@@ -107,23 +304,34 @@
   }
 
   // --- history.pushState / replaceState -------------------------------
+  // Rewrite the URL and update our location emulation afterwards so that
+  // subsequent reads of `location.pathname` (e.g. by the SPA router) return
+  // the new path under the TARGET origin (not the proxy prefix).
   try {
     const origPush = history.pushState.bind(history);
     const origReplace = history.replaceState.bind(history);
     history.pushState = function (state, title, url) {
+      let r;
       if (url) {
-        const r = rewriteUrl(String(url));
-        return origPush(state, title, r);
+        r = rewriteUrl(String(url));
+        const result = origPush(state, title, r);
+        updateLocationEmulation();
+        return result;
       }
       return origPush(state, title);
     };
     history.replaceState = function (state, title, url) {
+      let r;
       if (url) {
-        const r = rewriteUrl(String(url));
-        return origReplace(state, title, r);
+        r = rewriteUrl(String(url));
+        const result = origReplace(state, title, r);
+        updateLocationEmulation();
+        return result;
       }
       return origReplace(state, title);
     };
+    // Also update on popstate (back/forward navigation).
+    window.addEventListener('popstate', () => updateLocationEmulation());
   } catch (e) { /* ignore */ }
 
   // --- fetch() --------------------------------------------------------
@@ -273,30 +481,49 @@
   } catch (e) { /* ignore */ }
 
   // --- Anchor interception --------------------------------------------
-  // Catch clicks on <a> tags whose href is an absolute URL pointing at the
-  // target origin (or subdomain). The server-side rewriter handles static
-  // anchors in the HTML; this catches anchors that the page's JS inserted
-  // later.
-  document.addEventListener('click', function (e) {
-    let node = e.target;
-    while (node && node !== document.body) {
-      if (node.tagName === 'A' && node.href) {
-        const rewritten = rewriteUrl(node.href);
-        if (rewritten !== node.href) {
-          // We must use setAttribute so the browser re-resolves href.
-          node.setAttribute('href', rewritten);
-          // Re-check after the attribute change; if the browser still has
-          // the old absolute URL cached in .href, force a navigation.
-          if (node.href && !node.href.startsWith(PREFIX)) {
-            e.preventDefault();
-            location.href = rewritten;
+  // We DON'T use a capture-phase click listener — that would desync
+  // React 18's synthetic event system (it walks the DOM during the
+  // click handler and gets confused if attributes change mid-event).
+  // Instead, we override HTMLAnchorElement.prototype.href's descriptor so
+  // the browser navigates the proxied URL while getAttribute returns the
+  // user's intended (un-proxied) URL via a sidecar attribute. This is the
+  // pattern Corrosion uses.
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, 'href');
+    if (descriptor && descriptor.get && descriptor.set) {
+      Object.defineProperty(HTMLAnchorElement.prototype, 'href', {
+        get() {
+          // If we stashed the original, return it.
+          const orig = this.getAttribute('__proxy-href');
+          if (orig != null) return orig;
+          return descriptor.get.call(this);
+        },
+        set(val) {
+          // Stash the original under a sidecar attribute, then set the
+          // actual href to the proxied URL.
+          try {
+            this.setAttribute('__proxy-href', String(val));
+            const rewritten = rewriteUrl(String(val));
+            return descriptor.set.call(this, rewritten);
+          } catch (e) {
+            return descriptor.set.call(this, val);
           }
-        }
-        break;
-      }
-      node = node.parentNode;
+        },
+        enumerable: true,
+        configurable: true,
+      });
     }
-  }, true);
+  } catch (e) { /* ignore */ }
+  // Override getAttribute so it returns the sidecar value when present.
+  try {
+    const origGetAttribute = Element.prototype.getAttribute;
+    Element.prototype.getAttribute = function (name) {
+      if (name === 'href' && this.hasAttribute && this.hasAttribute('__proxy-href')) {
+        return this.getAttribute('__proxy-href');
+      }
+      return origGetAttribute.call(this, name);
+    };
+  } catch (e) { /* ignore */ }
 
   // --- MutationObserver for dynamically inserted elements ------------
   try {
