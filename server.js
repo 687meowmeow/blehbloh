@@ -101,10 +101,46 @@ function getOrCreateProxy(encoded) {
       //    would otherwise store cookies scoped to our domain, but that
       //    doesn't help us -- we want them server-side so subdomain-aware
       //    requests can see them.)
+      //
+      //    Exception: cookies whose names look like CSRF tokens (XSRF-TOKEN,
+      //    csrf_token, _csrf, etc.) ALSO get a duplicate Set-Cookie sent to
+      //    the browser, scoped to the proxy path /p/<encoded>/. Why: site JS
+      //    reads these cookies out of document.cookie and stuffs them into a
+      //    request header (X-XSRF-TOKEN, X-CSRF-Token, etc.). If we eat the
+      //    cookie, JS can't read it -> no header -> 403. Replit, lichess, and
+      //    most modern SPAs do this.
       const setCookie = proxyRes.headers['set-cookie'];
       if (setCookie) {
         cookies.set(setCookie, targetUrl.hostname);
         try { res2.removeHeader('set-cookie'); } catch (e) {}
+
+        // Forward CSRF-looking cookies to the browser. Rewrite the
+        // Set-Cookie attributes so the browser accepts them on our proxy
+        // host: drop Domain=, drop SameSite=None (broken on http), keep
+        // HttpOnly OFF so JS can read it, scope to /p/<encoded>/.
+        const isHttpsProxy = !!req.connection && req.connection.encrypted;
+        const passthrough = [];
+        for (const raw of setCookie) {
+          const nameMatch = raw.match(/^([^=;]+)/);
+          if (!nameMatch) continue;
+          const name = nameMatch[1].trim().toLowerCase();
+          const isCsrf = /csrf|xsrf|_token|token|nonce/i.test(name);
+          if (!isCsrf) continue;
+
+          let rewritten = raw
+            .replace(/;\s*Domain=[^;]+/gi, '')           // can't set Domain to target
+            .replace(/;\s*SameSite=[^;]+/gi, '')         // drop SameSite (default Lax on http)
+            .replace(/;\s*Secure/gi, '');                // drop Secure (broken on http proxy)
+          // Force HttpOnly off so JS can read document.cookie.
+          rewritten = rewritten.replace(/;\s*HttpOnly/gi, '');
+          // Scope to the proxy path so it doesn't leak across targets.
+          rewritten += '; Path=' + prefix + '/';
+          if (isHttpsProxy) rewritten += '; SameSite=None; Secure';
+          passthrough.push(rewritten);
+        }
+        if (passthrough.length) {
+          res2.setHeader('set-cookie', passthrough);
+        }
       }
 
       // 2. Strip headers that block our same-origin rewriting.
@@ -261,22 +297,54 @@ const server = app.listen(PORT, () => {
 // path back to the right cached proxy target and let http-proxy-middleware
 // handle the upgrade.
 server.on('upgrade', (req, socket, head) => {
-  const match = req.url.match(/^\/p\/([^/]+)/);
-  if (!match) { socket.destroy(); return; }
+  // Parse the URL so we can extract the __porigin query param the client
+  // side attached (see proxy-client.js PatchedWebSocket).
+  let reqUrl;
+  try { reqUrl = new URL(req.url, 'http://dummy'); }
+  catch (err) { socket.destroy(); return; }
+
+  // Extract /p/<encoded>/... from the path.
+  const m = reqUrl.pathname.match(/^\/p\/([^/]+)(.*)$/);
+  if (!m) { socket.destroy(); return; }
+  const encoded = m[1];
+  const innerPath = m[2] || '/';
+
+  // Pull __porigin out of the query (and reconstruct the upstream URL).
+  let pageOrigin = null;
   try {
-    const entry = getOrCreateProxy(match[1]);
-    // Strip leak headers on the upgrade too.
-    for (const name of ['x-forwarded-for','x-forwarded-host','x-forwarded-proto','x-real-ip','via','forwarded']) {
-      try { delete req.headers[name]; } catch (e) {}
-    }
-    // Attach cookies for the WebSocket handshake (e.g. lichess session).
-    const cookieHeader = cookies.get(entry.targetUrl.hostname, '/', entry.targetUrl.protocol === 'https:');
-    if (cookieHeader) req.headers.cookie = cookieHeader;
-    // Realistic UA on the WS handshake.
-    req.headers['user-agent'] = USER_AGENT;
-    req.headers['origin'] = entry.targetUrl.origin;
-    entry.proxy.upgrade(req, socket, head);
-  } catch (err) {
-    socket.destroy();
+    const porigin = reqUrl.searchParams.get('__porigin');
+    if (porigin) pageOrigin = Buffer.from(porigin, 'base64url').toString('utf8');
+  } catch (e) { /* ignore */ }
+
+  // Strip __porigin from the URL so it doesn't get forwarded to the target.
+  reqUrl.searchParams.delete('__porigin');
+  req.url = '/p/' + encoded + innerPath + (reqUrl.search || '');
+
+  let entry;
+  try { entry = getOrCreateProxy(encoded); }
+  catch (err) { socket.destroy(); return; }
+
+  // Strip leak headers on the upgrade too.
+  for (const name of ['x-forwarded-for','x-forwarded-host','x-forwarded-proto','x-real-ip','via','forwarded','cf-connecting-ip','cf-ipcountry','cf-ray','cf-visitor']) {
+    try { delete req.headers[name]; } catch (e) {}
   }
+
+  // Attach cookies for the WebSocket handshake (e.g. lichess session).
+  const cookieHeader = cookies.get(entry.targetUrl.hostname, '/', entry.targetUrl.protocol === 'https:');
+  if (cookieHeader) req.headers.cookie = cookieHeader;
+
+  // Realistic UA on the WS handshake.
+  req.headers['user-agent'] = USER_AGENT;
+
+  // Origin: for a same-origin WS (page origin == WS target origin) set it to
+  // the target origin so the request looks same-origin. For a cross-origin
+  // WS (e.g. lichess.org page -> socket3.lichess.org WS), use the page origin
+  // (lichess.org) — that's what the target's allowlist expects.
+  if (pageOrigin && pageOrigin !== entry.targetUrl.origin) {
+    req.headers['origin'] = pageOrigin;
+  } else {
+    req.headers['origin'] = entry.targetUrl.origin;
+  }
+
+  entry.proxy.upgrade(req, socket, head);
 });

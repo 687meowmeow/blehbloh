@@ -100,7 +100,42 @@ blehbloh/
 
 ## Changelog
 
-### v2 (this update)
+### v3 (this update — fixes for lichess live games + Replit signup)
+- **`X-Proxy-Origin` header on every fetch/XHR** so the server knows what
+  the "real" page origin is. Without this, the server can't tell a
+  cross-origin request (Replit → identitytoolkit.googleapis.com) from a
+  same-origin one and ends up sending the wrong `Origin` header to the
+  target — which breaks Firebase's CORS preflight and silently fails
+  Replit signup.
+- **`__porigin` query param on WebSocket/EventSource URLs** for the same
+  reason. Browsers don't allow custom headers on WebSocket, so we
+  smuggle the page origin via the URL. The server reads it, sets the
+  upstream `Origin` to the page origin (e.g. `lichess.org` for a WS to
+  `socket3.lichess.org`), and strips `__porigin` so it doesn't leak
+  upstream.
+- **`Sec-Fetch-Site` is now correctly computed**: `same-origin` if the
+  page origin matches the target origin, `cross-site` otherwise.
+  Previously it was hardcoded to `same-origin` which made all cross-
+  origin requests look wrong to the target.
+- **`Origin` header is now correctly set**: same-origin requests get
+  `Origin: <target>` (looks same-origin to the target), cross-origin
+  requests get `Origin: <page>` (matches the target's CORS allowlist,
+  e.g. Firebase's allowlist for identitytoolkit contains the page
+  origin like `replit.com`, not the API's own origin).
+- **CSRF-looking cookies pass through to the browser** so site JS can
+  read them out of `document.cookie` and put them in `X-CSRF-Token` /
+  `X-XSRF-TOKEN` headers. Heuristic: cookie names matching
+  `/csrf|xsrf|_token|token|nonce/i` get a duplicate Set-Cookie sent to
+  the browser, scoped to `/p/<encoded>/`, with `Domain=`, `Secure`,
+  `HttpOnly`, and `SameSite=None` stripped so the browser accepts them
+  on the proxy host. The server-side jar still stores the canonical
+  copy for upstream delivery.
+- **Cookie jar unaffected**: still keyed by target domain for proper
+  subdomain-aware delivery on upstream requests (so a session cookie
+  set by lichess.org with `Domain=lichess.org` is sent on subsequent
+  requests to socket3.lichess.org).
+
+### v2
 - **Crash fix**: `throttle.release()` was calling `this._state.get()` on
   what was actually a method, not the state Map. The first response
   completion crashed the server. Fixed.

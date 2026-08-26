@@ -124,6 +124,11 @@
   } catch (e) { /* ignore */ }
 
   // --- fetch() --------------------------------------------------------
+  // Patch fetch to rewrite the URL AND attach X-Proxy-Origin so the server
+  // knows what the "real" page origin is. Without this, the server can't
+  // tell a cross-origin request (e.g. Replit -> identitytoolkit.googleapis.com)
+  // from a same-origin one, and ends up sending the wrong Origin header to
+  // the target (which breaks Firebase CORS preflights, among others).
   try {
     const origFetch = window.fetch;
     if (origFetch) {
@@ -132,8 +137,30 @@
           if (typeof input === 'string') {
             input = rewriteUrl(input);
           } else if (input && input.url) {
-            // Request object
             input = new Request(rewriteUrl(input.url), input);
+          }
+          // Attach the page origin so the server can set the correct
+          // Origin header on the upstream request. If init already has
+          // headers, merge without clobbering.
+          init = init || {};
+          if (input instanceof Request && !init.headers) {
+            // pass through; we'll add the header below
+          }
+          let headers = init.headers || (input instanceof Request ? input.headers : undefined);
+          if (!headers) { headers = {}; init.headers = headers; }
+          // Headers can be a Headers object, a plain object, or an array.
+          // Convert to a plain object we can safely add to.
+          if (headers instanceof Headers) {
+            if (!headers.has('X-Proxy-Origin')) headers.set('X-Proxy-Origin', TARGET_ORIGIN);
+            init.headers = headers;
+          } else if (Array.isArray(headers)) {
+            if (!headers.some(([k]) => k.toLowerCase() === 'x-proxy-origin')) {
+              headers.push(['X-Proxy-Origin', TARGET_ORIGIN]);
+            }
+            init.headers = headers;
+          } else {
+            headers['X-Proxy-Origin'] = TARGET_ORIGIN;
+            init.headers = headers;
           }
         } catch (e) { /* fall through with original input */ }
         return origFetch.call(this, input, init);
@@ -141,12 +168,24 @@
     }
   } catch (e) { /* ignore */ }
 
-  // --- XMLHttpRequest.open() ------------------------------------------
+  // --- XMLHttpRequest.open() + send() ---------------------------------
+  // XHR doesn't have a per-call init object, so we stash the URL rewrite at
+  // open() time and add X-Proxy-Origin at send() time via setRequestHeader.
   try {
     const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       try { url = rewriteUrl(String(url)); } catch (e) { /* keep */ }
+      this.__proxyOrigin = TARGET_ORIGIN;
       return origOpen.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+      try {
+        if (this.__proxyOrigin) {
+          this.setRequestHeader('X-Proxy-Origin', this.__proxyOrigin);
+        }
+      } catch (e) { /* ignore */ }
+      return origSend.call(this, body);
     };
   } catch (e) { /* ignore */ }
 
@@ -175,13 +214,23 @@
 
   // --- WebSocket constructor -------------------------------------------
   // Many sites (e.g. lichess) build the ws:// URL dynamically in JS, so the
-  // server-side HTML rewriter can't catch it. Patch the constructor.
+  // server-side HTML rewriter can't catch it. Patch the constructor to
+  // rewrite the URL AND append the page origin as a query param so the
+  // server can set the correct Origin header on the upstream handshake.
+  // (Browsers don't allow setting custom headers on WebSocket, so we have
+  // to smuggle the page origin via the URL.)
   try {
     const OrigWebSocket = window.WebSocket;
     function PatchedWebSocket(url, protocols) {
       try {
         if (typeof url === 'string') url = rewriteUrl(url);
         else if (url && url.url) url = rewriteUrl(url.url);
+        // Append the page origin so the server's upgrade handler can
+        // use it for the Origin header on the upstream request.
+        if (typeof url === 'string' && url.indexOf('__porigin=') < 0) {
+          const sep = url.indexOf('?') >= 0 ? '&' : '?';
+          url = url + sep + '__porigin=' + encodeOrigin(TARGET_ORIGIN);
+        }
       } catch (e) { /* keep */ }
       if (Array.isArray(protocols)) return new OrigWebSocket(url, ...protocols);
       return new OrigWebSocket(url, protocols);
@@ -196,11 +245,20 @@
   } catch (e) { /* ignore */ }
 
   // --- EventSource (SSE) constructor ----------------------------------
+  // Same pattern as WebSocket: rewrite the URL + attach page origin.
   try {
     const OrigES = window.EventSource;
     if (OrigES) {
       function PatchedES(url, config) {
-        try { if (typeof url === 'string') url = rewriteUrl(url); } catch (e) { /* keep */ }
+        try {
+          if (typeof url === 'string') {
+            url = rewriteUrl(url);
+            if (url.indexOf('__porigin=') < 0) {
+              const sep = url.indexOf('?') >= 0 ? '&' : '?';
+              url = url + sep + '__porigin=' + encodeOrigin(TARGET_ORIGIN);
+            }
+          }
+        } catch (e) { /* keep */ }
         return new OrigES(url, config);
       }
       PatchedES.prototype = OrigES.prototype;
