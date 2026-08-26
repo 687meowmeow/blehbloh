@@ -1,0 +1,16 @@
+{
+  "name": "simple-web-proxy",
+  "version": "1.0.0",
+  "description": "Server-side proxy with an HTML/JS frontend to fetch and view arbitrary sites",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "http-proxy-middleware": "^2.0.6"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

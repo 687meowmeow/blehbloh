@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>blehbloh — Web Proxy</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1d2129;
+    --border: #2a2f3a;
+    --text: #e6e8eb;
+    --muted: #9aa1ac;
+    --accent: #5b8cff;
+    --accent-hover: #7aa1ff;
+    --ok: #4caf50;
+    --warn: #f0ad4e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  header {
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .nav-btn {
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--panel2);
+    color: var(--text);
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .nav-btn:hover { border-color: var(--accent); color: var(--accent-hover); }
+  .nav-btn:active { transform: translateY(1px); }
+  .nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #homeBtn { font-weight: 700; letter-spacing: 0.5px; }
+  #urlInput {
+    flex: 1;
+    padding: 9px 12px;
+    border-radius: 18px;
+    border: 1px solid var(--border);
+    background: #0d0f13;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    min-width: 0;
+  }
+  #urlInput:focus { border-color: var(--accent); }
+  #goBtn {
+    padding: 9px 18px;
+    border-radius: 18px;
+    border: none;
+    background: var(--accent);
+    color: white;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #goBtn:hover { background: var(--accent-hover); }
+  #goBtn:active { transform: translateY(1px); }
+  #status {
+    padding: 6px 18px;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+    display: inline-block;
+    transition: background 0.2s;
+  }
+  .dot.live { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  #frameWrap {
+    flex: 1;
+    position: relative;
+    background: white;
+  }
+  iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    background: white;
+  }
+  #startPage {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    color: var(--muted);
+    flex-direction: column;
+    gap: 14px;
+    text-align: center;
+    padding: 24px;
+  }
+  #startPage h2 { margin: 0; font-weight: 600; color: var(--text); font-size: 18px; }
+  #startPage p { margin: 0; max-width: 480px; line-height: 1.5; font-size: 14px; }
+  #startPage .hints { font-size: 12px; opacity: 0.7; max-width: 420px; }
+  #startPage code {
+    background: var(--panel2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--accent-hover);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <button class="nav-btn" id="homeBtn" title="Back to proxy home">blehbloh</button>
+  <button class="nav-btn" id="backBtn" title="Back">&#8592;</button>
+  <button class="nav-btn" id="fwdBtn" title="Forward">&#8594;</button>
+  <input id="urlInput" type="text" placeholder="Enter a URL, e.g. https://lichess.org" autocomplete="off" />
+  <button id="goBtn">Go</button>
+</header>
+
+<div id="status">
+  <span class="dot" id="statusDot"></span>
+  <span id="statusText">Enter a URL above and press Go. Top-level navigation is used (not an iframe) so sites that block framing still work.</span>
+</div>
+
+<div id="frameWrap">
+  <div id="startPage">
+    <h2>blehbloh web proxy</h2>
+    <p>A slow, browser-fingerprinted, server-side proxy. Loads the target site as a top-level navigation so JavaScript, WebSockets, and cookies all behave like a real browser visit.</p>
+    <p class="hints">
+      Try: <code>https://lichess.org</code> &nbsp; <code>https://news.ycombinator.com</code> &nbsp; <code>https://en.wikipedia.org</code>
+    </p>
+  </div>
+</div>
+
+<script>
+  const urlInput = document.getElementById('urlInput');
+  const goBtn = document.getElementById('goBtn');
+  const homeBtn = document.getElementById('homeBtn');
+  const backBtn = document.getElementById('backBtn');
+  const fwdBtn = document.getElementById('fwdBtn');
+  const statusText = document.getElementById('statusText');
+  const statusDot = document.getElementById('statusDot');
+  const startPage = document.getElementById('startPage');
+
+  function go(raw) {
+    const v = (raw ?? urlInput.value).trim();
+    if (!v) { setStatus('Please enter a URL.', 'warn'); return; }
+    window.location.href = '/go?url=' + encodeURIComponent(v);
+  }
+
+  function setStatus(msg, kind) {
+    statusText.textContent = msg;
+    statusDot.classList.toggle('live', kind === 'live');
+    statusDot.classList.toggle('warn', kind === 'warn');
+  }
+
+  goBtn.addEventListener('click', () => go());
+  urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  homeBtn.addEventListener('click', () => { window.location.href = '/'; });
+  backBtn.addEventListener('click', () => { if (history.length > 1) history.back(); else window.location.href = '/'; });
+  fwdBtn.addEventListener('click', () => { if (history.length > 1) history.forward(); });
+
+  // If we're already inside a proxy path, show the proxied URL in the input.
+  (function reflectUrl() {
+    const m = window.location.pathname.match(/^\/p\/([^/]+)(.*)$/);
+    if (m) {
+      try {
+        const origin = decodeURIComponent(
+          // base64url -> base64
+          Array.prototype.map.call(atob(m[1].replace(/-/g, '+').replace(/_/g, '/')),
+            c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')
+        );
+        urlInput.value = origin + m[2];
+        startPage.style.display = 'none';
+        setStatus('Proxying ' + origin, 'live');
+      } catch (e) {
+        // not a base64 we can decode; ignore
+      }
+    }
+  })();
+</script>
+
+</body>
+</html>
