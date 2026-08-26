@@ -51,62 +51,58 @@
     catch { return ''; }
   }
 
-  // Rewrite a single URL string to its proxied form, if it points at the
-  // target or any subdomain of the target. Returns the original string
-  // unchanged otherwise.
+  // Rewrite a single URL string to its proxied form. We rewrite ALL absolute
+  // URLs (any origin) through /p/<encoded-of-that-origin>/... — not just
+  // target-subdomain URLs. This is critical for sites like Replit that fan
+  // out to sibling origins (reachability.replit.app, *.replit.dev, etc.)
+  // and Firebase (identitytoolkit.googleapis.com). Without rewriting ALL
+  // absolute URLs, those cross-origin requests go directly from the
+  // browser to the upstream, leaking the user's real IP and failing CORS.
   function rewriteUrl(url) {
     if (!url || typeof url !== 'string') return url;
 
     // Already proxied.
     if (url.startsWith(PREFIX)) return url;
+    // Don't double-proxy a URL that's already /p/<encoded>/...
+    if (url.startsWith('/p/') && url.length > 3 && /[a-zA-Z0-9_-]+/.test(url.slice(3))) return url;
 
-    // Absolute URL to the target or one of its subdomains.
+    // Absolute https?:// URL — proxy it.
     if (/^https?:\/\//i.test(url)) {
       try {
         const u = new URL(url, TARGET_ORIGIN);
-        const apex = apexOf(u.hostname);
-        if (apex === TARGET_APEX) {
-          return `/p/${encodeOrigin(u.origin)}` + (u.pathname === '/' ? '/' : u.pathname) + (u.search || '') + (u.hash || '');
-        }
+        const out = `/p/${encodeOrigin(u.origin)}` + (u.pathname === '/' ? '/' : u.pathname) + (u.search || '') + (u.hash || '');
+        return out;
       } catch { return url; }
-      return url;
     }
 
-    // Protocol-relative //target/path
+    // Protocol-relative //host
     if (url.startsWith('//')) {
       try {
         const u = new URL('https:' + url);
-        const apex = apexOf(u.hostname);
-        if (apex === TARGET_APEX) {
-          return `/p/${encodeOrigin(u.origin)}` + (u.pathname === '/' ? '/' : u.pathname) + (u.search || '') + (u.hash || '');
-        }
-      } catch {}
-      return url;
+        return `/p/${encodeOrigin(u.origin)}` + (u.pathname === '/' ? '/' : u.pathname) + (u.search || '') + (u.hash || '');
+      } catch { return url; }
     }
 
-    // ws(s)://...target...
+    // ws(s):// — proxy via ws(s)://our-host/p/<encoded>/
     if (/^wss?:\/\//i.test(url)) {
       try {
         const proto = url.startsWith('wss') ? 'wss' : 'ws';
         const httpProto = proto === 'wss' ? 'https' : 'http';
         const u = new URL(url.replace(/^wss?:\/\//i, httpProto + '://'));
-        const apex = apexOf(u.hostname);
-        if (apex === TARGET_APEX) {
-          return `${proto}://${location.host}/p/${encodeOrigin(proto === 'wss' ? 'https://' + u.host : 'http://' + u.host)}${u.pathname}${u.search}${u.hash}`;
-        }
-      } catch {}
-      return url;
+        const enc = encodeOrigin(proto === 'wss' ? 'https://' + u.host : 'http://' + u.host);
+        return `${proto}://${location.host}/p/${enc}` + (u.pathname === '/' ? '/' : u.pathname) + (u.search || '') + (u.hash || '');
+      } catch { return url; }
+    }
+
+    // Absolute path: prepend the target's proxy prefix so the browser
+    // navigates inside the proxy instead of treating it as a path on our
+    // domain. (The <base> tag does NOT affect absolute paths.)
+    if (url.startsWith('/') && !url.startsWith('//')) {
+      return PREFIX + url;
     }
 
     // Relative URL: leave it. The injected <base href="/p/<encoded>/"> tag
     // makes it resolve correctly inside the proxy.
-    // EXCEPT absolute-path URLs (e.g. "/api/foo") which are NOT affected by
-    // the <base> tag and would resolve to the proxy host root (404). Rewrite
-    // them to /p/<encoded>/api/foo.
-    if (url.startsWith('/') && !url.startsWith('//') && !url.startsWith(PREFIX)) {
-      return PREFIX + url;
-    }
-
     return url;
   }
 
@@ -305,10 +301,10 @@
   // --- MutationObserver for dynamically inserted elements ------------
   try {
     const ATTRIBS = {
-      A: ['href'],
-      IMG: ['src', 'srcset'],
+      A: ['href', 'ping'],
+      IMG: ['src', 'srcset', 'data-src', 'data-srcset', 'data-original', 'data-lazy-src'],
       SCRIPT: ['src'],
-      LINK: ['href'],
+      LINK: ['href', 'imagesrcset', 'imagesizes'],
       IFRAME: ['src'],
       SOURCE: ['src', 'srcset'],
       FORM: ['action'],
@@ -316,25 +312,81 @@
       AUDIO: ['src'],
       EMBED: ['src'],
       OBJECT: ['data'],
-      AREA: ['href'],
+      AREA: ['href', 'ping'],
+      INPUT: ['formaction', 'src'],
+      BUTTON: ['formaction'],
+      TRACK: ['src'],
+      // SVG: <use href>, <image href>
+      USE: ['href', 'xlink:href'],
+      IMAGE: ['href', 'xlink:href'],
+      // Lazy-loading libraries
+      DIV: ['data-bg', 'data-background', 'data-src', 'data-lazy', 'data-original'],
+      SECTION: ['data-bg', 'data-background'],
+      ARTICLE: ['data-bg', 'data-background'],
+      LI: ['data-bg', 'data-background'],
+      SPAN: ['data-bg', 'data-background'],
     };
 
+    // Rewrite srcset value with descriptor-aware splitting.
+    // Per spec, srcset is "url descriptor, url descriptor, ..." where the
+    // descriptor is "1x", "2x", "100w", etc. URLs can contain commas (e.g.
+    // Cloudflare's cdn-cgi/image URLs), so a naive comma split breaks them.
+    // Strategy: scan the string; a comma is an entry separator ONLY if the
+    // next non-space token starts a new URL (/, ./, ../, https?:, //, or
+    // any non-space char). Otherwise the comma is part of the URL.
     function rewriteSrcset(value) {
       if (!value) return value;
-      // srcset is comma-separated: "url 1x, url 2x"
-      return value
-        .split(',')
-        .map(part => {
-          const trimmed = part.trim();
-          const sp = trimmed.indexOf(' ');
-          const u = sp >= 0 ? trimmed.slice(0, sp) : trimmed;
-          const r = rewriteUrl(u);
-          return sp >= 0 ? r + trimmed.slice(sp) : r;
-        })
-        .join(', ');
+      const parts = [];
+      let i = 0;
+      while (i < value.length) {
+        // Skip whitespace.
+        while (i < value.length && /\s/.test(value[i])) i++;
+        if (i >= value.length) break;
+        // Read one entry.
+        let j = i;
+        let entry = '';
+        while (j < value.length) {
+          const ch = value[j];
+          if (ch === ',') {
+            // Look ahead: is the next non-space a URL start?
+            let k = j + 1;
+            while (k < value.length && /\s/.test(value[k])) k++;
+            const nextIsUrlStart = k < value.length && !/[\s,]/.test(value[k]);
+            if (nextIsUrlStart) {
+              // This comma is a separator.
+              break;
+            }
+            // Part of the URL (Cloudflare cdn-cgi URLs contain commas).
+            entry += ch;
+            j++;
+          } else {
+            entry += ch;
+            j++;
+          }
+        }
+        entry = entry.trim();
+        if (entry) {
+          // Split into URL + descriptor (last whitespace before a descriptor).
+          // Descriptor is \d+(x|w).
+          const m = entry.match(/^(.+?)\s+(\d+(?:\.\d+)?(?:x|w))$/i);
+          let url, descriptor;
+          if (m) {
+            url = m[1];
+            descriptor = m[2];
+          } else {
+            url = entry;
+            descriptor = '';
+          }
+          const rewritten = rewriteUrl(url);
+          parts.push(descriptor ? `${rewritten} ${descriptor}` : rewritten);
+        }
+        i = j + 1;
+      }
+      return parts.join(', ');
     }
 
     function rewriteNode(root) {
+      if (!root || root.nodeType !== 1) return;
       const stack = [root];
       while (stack.length) {
         const el = stack.pop();
@@ -345,30 +397,41 @@
             if (!el.hasAttribute(attr)) continue;
             const v = el.getAttribute(attr);
             if (!v) continue;
-            if (attr === 'srcset') {
-              el.setAttribute(attr, rewriteSrcset(v));
-            } else if (attr === 'action') {
-              el.setAttribute(attr, rewriteUrl(v));
+            if (attr === 'srcset' || attr === 'data-srcset' || attr === 'imagesrcset') {
+              const r = rewriteSrcset(v);
+              if (r !== v) el.setAttribute(attr, r);
             } else {
               const r = rewriteUrl(v);
               if (r !== v) el.setAttribute(attr, r);
             }
           }
         }
-        // recurse into children
+        // Also rewrite inline style="url(...)" attributes.
+        if (el.hasAttribute && el.hasAttribute('style')) {
+          const s = el.getAttribute('style');
+          if (s && s.includes('url(')) {
+            const r = s.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (full, q, u) => {
+              if (!u || u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('#')) return full;
+              const rewritten = rewriteUrl(u);
+              return `url(${q}${rewritten}${q})`;
+            });
+            if (r !== s) el.setAttribute('style', r);
+          }
+        }
+        // Recurse into children + shadow roots if accessible.
         if (el.children && el.children.length) {
           for (let i = 0; i < el.children.length; i++) stack.push(el.children[i]);
         }
       }
     }
 
-    // First pass: rewrite what's already in the DOM at script-injection time.
-    // (The script is in <head>, so most of the body isn't parsed yet; the
-    // MutationObserver below catches the rest as it streams in.)
+    // Run the initial rewrite SYNCHRONOUSLY (the script is at the top of
+    // <head>, so most of <body> isn't parsed yet — but anything already in
+    // <head> like <link>, <meta> needs rewriting before the browser fetches
+    // it). Run again on DOMContentLoaded for the rest of the body.
+    rewriteNode(document.documentElement);
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => rewriteNode(document.documentElement));
-    } else {
-      rewriteNode(document.documentElement);
     }
 
     const observer = new MutationObserver(mutations => {

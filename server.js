@@ -20,7 +20,7 @@ const https = require('https');
 const zlib = require('zlib');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
-const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, injectIntoHtml } = require('./lib/rewrite');
+const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, rewriteCssUrls, rewriteSrcsetValue, injectIntoHtml } = require('./lib/rewrite');
 const { buildOutboundHeaders, USER_AGENT } = require('./lib/fingerprint');
 const { gateFromEnv } = require('./lib/throttle');
 const { CookieJar } = require('./lib/cookieJar');
@@ -224,9 +224,25 @@ function makeOnProxyRes(targetUrl, encoded, prefix) {
       try {
         const buf = Buffer.concat(chunks);
         let body = buf.toString('utf8');
-        body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
-        if (isHtml) {
+        if (isCss) {
+          // For external .css files, only rewrite CSS url(...) -- the
+          // HTML-attribute regex would mangle the CSS.
+          body = rewriteCssUrls(body, targetUrl, encoded);
+        } else if (isHtml) {
+          // For HTML, rewrite URLs everywhere (HTML attributes, inline
+          // CSS, JS string literals) and inject the <base> + script.
+          body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
           body = injectIntoHtml(body, encoded, targetUrl.origin);
+        } else if (isJs) {
+          // For JS, rewrite absolute + ws:// URLs (already done by
+          // rewriteTextBody) but DON'T apply URL_ATTR_RE (which is
+          // HTML-attribute-only). We use rewriteTextBody for the absolute
+          // URL substitution only; URL_ATTR_RE only matches HTML attrs
+          // so it's harmless on JS. Inline <style> regex also harmless.
+          body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
+        } else {
+          // JSON / other text: rewrite absolute URLs only.
+          body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
         }
         // Body changed: strip content-encoding (we decoded), recompute length.
         try { res.removeHeader('content-encoding'); } catch (e) {}

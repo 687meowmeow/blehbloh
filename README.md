@@ -100,79 +100,82 @@ blehbloh/
 
 ## Changelog
 
-### v4 (this update — fundamental fixes for "browser-like experience")
-This is a big refactor. The previous versions were patching symptoms;
-this one fixes the underlying architecture so the proxy behaves the way
-a real browser does.
+### v5 (this update — root-cause fixes for images + layout + lichess + replit)
+Diagnosed empirically by fetching live lichess.org and replit.com HTML and
+running the actual rewriter against them. Found 7 specific bugs:
 
-- **Streaming responses no longer buffered.** Replaced HPM's
-  `responseInterceptor` (which buffers the entire response body before
-  calling the rewrite callback — breaks SSE / long-poll / chunked text)
-  with a custom `onProxyRes` handler that pipes streaming responses
-  through directly and only buffers the body when we actually need to
-  rewrite (HTML / CSS / JS / JSON). Lichess uses long-polling for some
-  features; this fixes the "lobby never updates" symptom.
-- **Brotli decompression fixed.** `zlib.createUnzip()` does NOT auto-
-  detect brotli — Node needs `createBrotliDecompress()` explicitly. v3
-  advertised `accept-encoding: br` but couldn't decode it, so any
-  brotli-encoded response body came back empty (which is why Replit
-  "wouldn't even load" — its home page is brotli-encoded). Now: gzip
-  → `createUnzip()`, deflate → `createUnzip()`, br →
-  `createBrotliDecompress()`.
-- **ALL cookies mirrored to the browser** (not just CSRF-named ones).
-  Site JS often reads session info out of `document.cookie` — for
-  analytics, A/B tests, feature flags, and (importantly) CSRF tokens.
-  v3 only mirrored CSRF-named cookies; v4 mirrors every cookie the
-  upstream sets, scoped to `/p/<encoded>/` with safe attributes
-  (`Domain`/`HttpOnly`/`Secure` stripped so the browser accepts it on
-  the proxy host and JS can read it).
-- **Browser-sent cookies sync back to the server jar.** When JS sets
-  `document.cookie = "session=xyz"`, the browser stores it scoped to
-  the proxy host. On the next request, the browser sends it; v4's
-  `buildOutboundHeaders` syncs it into the server-side jar so the
-  upstream actually receives it. Before v4, JS-set cookies were
-  silently dropped.
-- **Absolute-path URLs rewritten.** `<base href="/p/<encoded>/">` only
-  affects relative URLs — absolute paths (`href="/login"`,
-  `fetch('/api/foo')`) ignore the base tag and go straight to the
-  proxy host (404). v4 rewrites `/foo` to `/p/<encoded>/foo` both
-  server-side (in HTML attributes via `URL_ATTR_RE`) and client-side
-  (in the `rewriteUrl` helper used by `fetch`/`XHR`/etc.). This was
-  probably the single biggest "doesn't load" cause.
-- **Hostname regex hardened.** Added `(?![a-zA-Z0-9.-])` negative
-  lookahead so `https://replit.com.evil.com` does NOT match
-  `replit.com` (it would have been rewritten to
-  `/p/<encoded>/.evil.com` before). Also added optional `:port` so
-  `https://lichess.org:8443` matches correctly.
-- **Existing `<base>` tags removed before injecting ours.** The
-  HTML spec says the LAST `<base>` wins; if a page already has
-  `<base href="https://other.com/">`, my injection would have been
-  overridden and relative URLs would break.
-- **Cookie jar `syncFromBrowser` method.** Lets the jar absorb JS-set
-  cookies and merge with server-set cookies.
+- **Double-prefix bug on cross-origin absolute URLs (the Replit killer).**
+  `<script src="https://cdn.replit.com/_next/foo.js">` was rewritten to
+  `/p/<encoded-replit>/p/<encoded-cdn>/_next/foo.js` (double-prefixed).
+  The browser requested that, the proxy stripped the outer prefix, forwarded
+  `replit.com/p/<encoded-cdn>/_next/foo.js` → 404. EVERY Replit JS chunk
+  failed. Fixed: skip-check now recognizes any `/p/<encoded>/` prefix, not
+  just the target's own.
+- **`<meta http-equiv="Content-Security-Policy">` not stripped (the Lichess
+  killer).** Lichess ships CSP as a meta tag (not a header). My rewriter
+  rewrote the `wss://socketN.lichess.org` entries to `wss://localhost/p/...`
+  but CSP path-matching requires the source's path to end with `/`. The
+  rewritten sources don't, so the actual WS URL was rejected. Lobby never
+  populated. Fixed: meta CSP tags are now stripped entirely (the response
+  CSP header was already stripped).
+- **CSS `url('/foo')` never rewritten.** Affected inline `<style>` and
+  external `.css` files. `@font-face{src:url('/fonts/x.woff2')}` 404'd
+  against the proxy host. Fixed: new `rewriteCssUrls` for text/css content
+  + inline `<style>` blocks. Skips `data:`/`blob:`/`#`/`mailto:`.
+- **Cross-apex origins not proxied.** `lichess1.org` (lichess's asset CDN,
+  separate eTLD+1), `cdn.replit.com`, `reachability.replit.app`,
+  `identitytoolkit.googleapis.com` (Firebase) were all left untouched
+  because the rewriter only matched the target's own eTLD+1. Result: the
+  browser made direct cross-origin requests to these origins, leaking the
+  user's real IP and failing CORS. Fixed: the rewriter now proxies ALL
+  absolute URLs through `/p/<encoded-of-that-origin>/`. Each origin gets
+  its own encoded prefix.
+- **`srcset` not in `URL_ATTR_RE`.** Initial-HTML `srcset` was never
+  rewritten server-side. Fixed: separate `SRCSET_ATTR_RE` handles
+  `srcset`/`imagesrcset`/`data-srcset`.
+- **`rewriteSrcset` destroyed Cloudflare URLs by splitting on `,`.**
+  Cloudflare's `cdn-cgi/image` URLs contain un-encoded commas
+  (`/cdn-cgi/image/width=128,quality=80,format=auto/...`). The naive
+  `value.split(',')` fragmented them. Fixed: descriptor-aware scanner
+  that only treats a comma as an entry separator if the next non-space
+  token looks like a URL start.
+- **Absolute paths in HTML attrs not rewritten for `<base>` tag limitation.**
+  Per RFC 3986, `<base href="/p/<encoded>/">` does NOT affect absolute
+  paths (`/foo`). They were silently 404ing against the proxy host. Already
+  fixed in v4, now applied more robustly.
+
+Additional v5 improvements:
+- Expanded `ATTRIBS` table in the client-side MutationObserver: added
+  `ping`, `imagesrcset`, `imagesizes`, `formaction`, `data-bg`,
+  `data-original`, `data-lazy`, `data-lazy-src`, `data-srcset`,
+  `data-poster`, `data-share-url`, `data-download-url`, SVG `<use>`,
+  SVG `<image>`, `xlink:href`, `track`.
+- Initial-document rewrite now runs SYNCHRONOUSLY at script-injection
+  time (was on DOMContentLoaded, which was too late for `<head>` elements
+  like `<link>` / `<meta>`).
+- Inline `style="url(...)"` attributes now rewritten.
+- Meta refresh (`<meta http-equiv="refresh" content="0; url=/foo">`)
+  now handled.
+
+### v4
+- Streaming responses no longer buffered (custom `onProxyRes`).
+- Broton decompression fixed (`createBrotliDecompress`).
+- ALL cookies mirrored to browser.
+- Browser-set cookies sync back to server jar.
+- Hostname regex hardened.
+- Existing `<base>` tags removed before injecting ours.
 
 ### v3
-- **`X-Proxy-Origin` header** on every fetch/XHR so the server knows what
-  the "real" page origin is. Without this, the server can't tell a
-  cross-origin request (Replit → identitytoolkit.googleapis.com) from a
-  same-origin one and ends up sending the wrong `Origin` header to the
-  target — which breaks Firebase's CORS preflight and silently fails
-  Replit signup.
-- **`__porigin` query param** on WebSocket/EventSource URLs for the same
-  reason (browsers don't allow custom headers on WebSocket, so we
-  smuggle the page origin via the URL).
-- **`Sec-Fetch-Site` correctly computed**: `same-origin` if page matches
-  target, `cross-site` otherwise (was hardcoded to `same-origin`).
-- **`Origin` header correctly set**: same-origin → `<target>`,
-  cross-origin → `<page>` (matches Firebase's CORS allowlist).
+- `X-Proxy-Origin` header on every fetch/XHR.
+- `__porigin` query param on WebSocket/EventSource URLs.
+- `Sec-Fetch-Site` correctly computed.
+- `Origin` header correctly set.
 
 ### v2
-- Crash fix in `throttle.release()` (was calling `this._state.get()`
-  on a method, not the Map).
-- Dropped `zstd` from `accept-encoding` (Node can't decode it).
+- Crash fix in `throttle.release()`.
+- Dropped `zstd` from `accept-encoding`.
 - Location / Refresh / Link headers rewritten.
 - WebSocket + EventSource constructors patched client-side.
-- `content-encoding` / `content-length` stripped from rewritten responses.
 
 ### v1 (initial)
 - Realistic browser fingerprint (UA, sec-ch-ua, Sec-Fetch-*).
