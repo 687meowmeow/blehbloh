@@ -100,6 +100,13 @@
 
     // Relative URL: leave it. The injected <base href="/p/<encoded>/"> tag
     // makes it resolve correctly inside the proxy.
+    // EXCEPT absolute-path URLs (e.g. "/api/foo") which are NOT affected by
+    // the <base> tag and would resolve to the proxy host root (404). Rewrite
+    // them to /p/<encoded>/api/foo.
+    if (url.startsWith('/') && !url.startsWith('//') && !url.startsWith(PREFIX)) {
+      return PREFIX + url;
+    }
+
     return url;
   }
 

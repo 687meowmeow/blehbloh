@@ -100,56 +100,79 @@ blehbloh/
 
 ## Changelog
 
-### v3 (this update — fixes for lichess live games + Replit signup)
-- **`X-Proxy-Origin` header on every fetch/XHR** so the server knows what
+### v4 (this update — fundamental fixes for "browser-like experience")
+This is a big refactor. The previous versions were patching symptoms;
+this one fixes the underlying architecture so the proxy behaves the way
+a real browser does.
+
+- **Streaming responses no longer buffered.** Replaced HPM's
+  `responseInterceptor` (which buffers the entire response body before
+  calling the rewrite callback — breaks SSE / long-poll / chunked text)
+  with a custom `onProxyRes` handler that pipes streaming responses
+  through directly and only buffers the body when we actually need to
+  rewrite (HTML / CSS / JS / JSON). Lichess uses long-polling for some
+  features; this fixes the "lobby never updates" symptom.
+- **Brotli decompression fixed.** `zlib.createUnzip()` does NOT auto-
+  detect brotli — Node needs `createBrotliDecompress()` explicitly. v3
+  advertised `accept-encoding: br` but couldn't decode it, so any
+  brotli-encoded response body came back empty (which is why Replit
+  "wouldn't even load" — its home page is brotli-encoded). Now: gzip
+  → `createUnzip()`, deflate → `createUnzip()`, br →
+  `createBrotliDecompress()`.
+- **ALL cookies mirrored to the browser** (not just CSRF-named ones).
+  Site JS often reads session info out of `document.cookie` — for
+  analytics, A/B tests, feature flags, and (importantly) CSRF tokens.
+  v3 only mirrored CSRF-named cookies; v4 mirrors every cookie the
+  upstream sets, scoped to `/p/<encoded>/` with safe attributes
+  (`Domain`/`HttpOnly`/`Secure` stripped so the browser accepts it on
+  the proxy host and JS can read it).
+- **Browser-sent cookies sync back to the server jar.** When JS sets
+  `document.cookie = "session=xyz"`, the browser stores it scoped to
+  the proxy host. On the next request, the browser sends it; v4's
+  `buildOutboundHeaders` syncs it into the server-side jar so the
+  upstream actually receives it. Before v4, JS-set cookies were
+  silently dropped.
+- **Absolute-path URLs rewritten.** `<base href="/p/<encoded>/">` only
+  affects relative URLs — absolute paths (`href="/login"`,
+  `fetch('/api/foo')`) ignore the base tag and go straight to the
+  proxy host (404). v4 rewrites `/foo` to `/p/<encoded>/foo` both
+  server-side (in HTML attributes via `URL_ATTR_RE`) and client-side
+  (in the `rewriteUrl` helper used by `fetch`/`XHR`/etc.). This was
+  probably the single biggest "doesn't load" cause.
+- **Hostname regex hardened.** Added `(?![a-zA-Z0-9.-])` negative
+  lookahead so `https://replit.com.evil.com` does NOT match
+  `replit.com` (it would have been rewritten to
+  `/p/<encoded>/.evil.com` before). Also added optional `:port` so
+  `https://lichess.org:8443` matches correctly.
+- **Existing `<base>` tags removed before injecting ours.** The
+  HTML spec says the LAST `<base>` wins; if a page already has
+  `<base href="https://other.com/">`, my injection would have been
+  overridden and relative URLs would break.
+- **Cookie jar `syncFromBrowser` method.** Lets the jar absorb JS-set
+  cookies and merge with server-set cookies.
+
+### v3
+- **`X-Proxy-Origin` header** on every fetch/XHR so the server knows what
   the "real" page origin is. Without this, the server can't tell a
   cross-origin request (Replit → identitytoolkit.googleapis.com) from a
   same-origin one and ends up sending the wrong `Origin` header to the
   target — which breaks Firebase's CORS preflight and silently fails
   Replit signup.
-- **`__porigin` query param on WebSocket/EventSource URLs** for the same
-  reason. Browsers don't allow custom headers on WebSocket, so we
-  smuggle the page origin via the URL. The server reads it, sets the
-  upstream `Origin` to the page origin (e.g. `lichess.org` for a WS to
-  `socket3.lichess.org`), and strips `__porigin` so it doesn't leak
-  upstream.
-- **`Sec-Fetch-Site` is now correctly computed**: `same-origin` if the
-  page origin matches the target origin, `cross-site` otherwise.
-  Previously it was hardcoded to `same-origin` which made all cross-
-  origin requests look wrong to the target.
-- **`Origin` header is now correctly set**: same-origin requests get
-  `Origin: <target>` (looks same-origin to the target), cross-origin
-  requests get `Origin: <page>` (matches the target's CORS allowlist,
-  e.g. Firebase's allowlist for identitytoolkit contains the page
-  origin like `replit.com`, not the API's own origin).
-- **CSRF-looking cookies pass through to the browser** so site JS can
-  read them out of `document.cookie` and put them in `X-CSRF-Token` /
-  `X-XSRF-TOKEN` headers. Heuristic: cookie names matching
-  `/csrf|xsrf|_token|token|nonce/i` get a duplicate Set-Cookie sent to
-  the browser, scoped to `/p/<encoded>/`, with `Domain=`, `Secure`,
-  `HttpOnly`, and `SameSite=None` stripped so the browser accepts them
-  on the proxy host. The server-side jar still stores the canonical
-  copy for upstream delivery.
-- **Cookie jar unaffected**: still keyed by target domain for proper
-  subdomain-aware delivery on upstream requests (so a session cookie
-  set by lichess.org with `Domain=lichess.org` is sent on subsequent
-  requests to socket3.lichess.org).
+- **`__porigin` query param** on WebSocket/EventSource URLs for the same
+  reason (browsers don't allow custom headers on WebSocket, so we
+  smuggle the page origin via the URL).
+- **`Sec-Fetch-Site` correctly computed**: `same-origin` if page matches
+  target, `cross-site` otherwise (was hardcoded to `same-origin`).
+- **`Origin` header correctly set**: same-origin → `<target>`,
+  cross-origin → `<page>` (matches Firebase's CORS allowlist).
 
 ### v2
-- **Crash fix**: `throttle.release()` was calling `this._state.get()` on
-  what was actually a method, not the state Map. The first response
-  completion crashed the server. Fixed.
-- **`accept-encoding`**: dropped `zstd` (Node can't decode it natively).
-- **Location / Refresh / Link headers are now rewritten** so a target's
-  302 redirect (e.g. `http://lichess.org` → `https://lichess.org`) no
-  longer escapes the proxy.
-- **`WebSocket` and `EventSource` constructors patched client-side** so
-  sites that build their WS/SSE URLs dynamically in JS (lichess) stay
-  inside the proxy.
-- **`content-encoding` / `content-length` stripped from rewritten
-  responses** to avoid the client getting a decoded body with mismatched
-  headers.
-- **`apexOf` helper** in `lib/rewrite.js` for clean subdomain matching.
+- Crash fix in `throttle.release()` (was calling `this._state.get()`
+  on a method, not the Map).
+- Dropped `zstd` from `accept-encoding` (Node can't decode it).
+- Location / Refresh / Link headers rewritten.
+- WebSocket + EventSource constructors patched client-side.
+- `content-encoding` / `content-length` stripped from rewritten responses.
 
 ### v1 (initial)
 - Realistic browser fingerprint (UA, sec-ch-ua, Sec-Fetch-*).

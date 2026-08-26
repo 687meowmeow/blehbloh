@@ -17,7 +17,8 @@ const express = require('express');
 const path = require('path');
 const http = require('http');
 const https = require('https');
-const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
+const zlib = require('zlib');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, injectIntoHtml } = require('./lib/rewrite');
 const { buildOutboundHeaders, USER_AGENT } = require('./lib/fingerprint');
@@ -58,6 +59,204 @@ app.use(express.static(path.join(__dirname, 'public')));
 // upgrade requests (which bypass Express routing) can find the right one.
 const proxyCache = new Map();
 
+// Headers we strip from the upstream response (we either recompute them or
+// they block our same-origin rewriting from working).
+const STRIP_RESPONSE_HEADERS = new Set([
+  'content-security-policy',
+  'content-security-policy-report-only',
+  'x-frame-options',
+  'cross-origin-opener-policy',
+  'cross-origin-embedder-policy',
+  'cross-origin-resource-policy',
+  'permissions-policy',
+  'strict-transport-security',
+  'connection',         // hop-by-hop
+  'keep-alive',         // hop-by-hop
+  'transfer-encoding',  // we send either chunked or content-length, not both
+]);
+
+// URL-bearing response headers that need rewriting to keep the browser
+// inside the proxy.
+function rewriteUrlHeader(name, value, targetUrl, proxyHost) {
+  if (!value) return value;
+  if (name === 'location') {
+    return rewriteSingleUrl(value, targetUrl, proxyHost);
+  }
+  if (name === 'refresh') {
+    // Refresh: 5; url=https://target/foo
+    return value.replace(
+      /url=(https?:\/\/[^;]+)/i,
+      (m, u) => 'url=' + rewriteSingleUrl(u, targetUrl, proxyHost)
+    );
+  }
+  if (name === 'link') {
+    // Link: <https://target/foo>; rel=preload
+    return value.replace(
+      /<([^>]+)>/g,
+      (m, u) => '<' + rewriteSingleUrl(u, targetUrl, proxyHost) + '>'
+    );
+  }
+  return value;
+}
+
+// Mirror an upstream Set-Cookie to the browser, scoped to /p/<encoded>/.
+// - Strip Domain= (we can't set it to the target's domain).
+// - Strip Secure (the proxy may be HTTP; if HTTPS, we re-add it below).
+// - Strip SameSite (the proxy is same-origin from the browser's view, so
+//   default Lax is fine).
+// - Strip HttpOnly (we want JS to be able to read document.cookie for
+//   CSRF-token flows).
+// - Scope to /p/<encoded>/ so cookies don't leak between proxy targets.
+function mirrorSetCookie(raw, prefix, isHttpsProxy) {
+  let rewritten = raw
+    .replace(/;\s*Domain=[^;]+/gi, '')
+    .replace(/;\s*SameSite=[^;]+/gi, '')
+    .replace(/;\s*Secure/gi, '')
+    .replace(/;\s*HttpOnly/gi, '');
+  rewritten += '; Path=' + prefix + '/';
+  if (isHttpsProxy) rewritten += '; SameSite=None; Secure';
+  return rewritten;
+}
+
+// Custom response handler. We use `selfHandleResponse: true` and handle the
+// response ourselves instead of using HPM's `responseInterceptor` because
+// the latter buffers the entire response body before calling our callback,
+// which breaks streaming responses (SSE, NDJSON, long-poll, chunked text).
+//
+// For each response we:
+//   1. Mirror Set-Cookie to the browser (all cookies, scoped to proxy path)
+//      and also store in the server-side jar.
+//   2. Strip headers that block same-origin rewriting (CSP, X-Frame-Options,
+//      COOP/COEP/CORP, HSTS, hop-by-hop headers).
+//   3. Rewrite URL-bearing headers (Location, Refresh, Link).
+//   4. Decide: stream through (binary, SSE) or buffer + rewrite (text).
+//   5. For text: decompress (gzip/deflate/br), collect, rewrite URLs + inject
+//      <base>+script for HTML, re-send without content-encoding/length.
+function makeOnProxyRes(targetUrl, encoded, prefix) {
+  return function onProxyRes(proxyRes, req, res) {
+    // Determine if our connection to the browser is HTTPS (affects cookie
+    // SameSite/Secure attributes we set on mirrored Set-Cookie).
+    const isHttpsProxy = !!(req.connection && req.connection.encrypted)
+      || req.headers['x-forwarded-proto'] === 'https';
+
+    // 1. Set-Cookie handling: store in jar + mirror to browser.
+    const setCookie = proxyRes.headers['set-cookie'];
+    if (setCookie) {
+      cookies.set(setCookie, targetUrl.hostname);
+      const mirrored = setCookie.map((raw) => mirrorSetCookie(raw, prefix, isHttpsProxy));
+      // We'll set this on `res` after copying other headers.
+      proxyRes.headers['__mirrored_set_cookie'] = mirrored;
+      delete proxyRes.headers['set-cookie'];
+    }
+
+    // 2. Status code.
+    res.statusCode = proxyRes.statusCode || 200;
+
+    // 3. Copy + rewrite headers (skip ones we strip; rewrite URL-bearing ones).
+    for (const [name, value] of Object.entries(proxyRes.headers)) {
+      if (name === '__mirrored_set_cookie') continue;
+      const lower = name.toLowerCase();
+      if (STRIP_RESPONSE_HEADERS.has(lower)) continue;
+      if (lower === 'content-encoding' || lower === 'content-length') {
+        // We'll recompute these for rewritten text; for binary/streaming
+        // they'll be handled below.
+        continue;
+      }
+      const rewritten = rewriteUrlHeader(lower, value, targetUrl, req.headers.host);
+      try { res.setHeader(name, rewritten); } catch (e) {}
+    }
+
+    // Apply mirrored Set-Cookie (after other headers, in case removing then
+    // re-adding the header is needed).
+    if (proxyRes.headers['__mirrored_set_cookie']) {
+      try { res.setHeader('set-cookie', proxyRes.headers['__mirrored_set_cookie']); } catch (e) {}
+      delete proxyRes.headers['__mirrored_set_cookie'];
+    }
+
+    // 4. Decide: stream through (binary, SSE) or buffer + rewrite (text).
+    const contentType = (proxyRes.headers['content-type'] || '').toLowerCase();
+    const isHtml  = contentType.includes('text/html');
+    const isJs    = contentType.includes('javascript') || contentType.includes('ecmascript');
+    const isCss  = contentType.includes('text/css');
+    const isJson = contentType.includes('json') && !contentType.includes('stream');
+    const isText = isHtml || isJs || isCss || isJson || contentType.includes('text/');
+    const isStreaming = contentType.includes('text/event-stream')
+      || contentType.includes('application/x-ndjson')
+      || contentType.includes('application/stream+json')
+      || contentType.includes('application/grpc-web');
+
+    if (!isText || isStreaming) {
+      // Stream through directly (binary, fonts, images, video, SSE, NDJSON).
+      // Preserve original content-length/content-encoding.
+      const enc = proxyRes.headers['content-encoding'];
+      const len = proxyRes.headers['content-length'];
+      if (enc) try { res.setHeader('content-encoding', enc); } catch (e) {}
+      if (len) try { res.setHeader('content-length', len); } catch (e) {}
+      proxyRes.pipe(res);
+      return;
+    }
+
+    // 5. For text: decompress, collect, rewrite, send.
+    const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+    if (process.env.DEBUG_PROXY) {
+      console.error(`[debug] ${req.method} ${req.path} content-type=${contentType} encoding=${encoding} status=${proxyRes.statusCode}`);
+    }
+    let stream = proxyRes;
+    if (encoding.includes('br')) {
+      // Broton is NOT auto-detected by createUnzip -- we need a separate
+      // decompressor for it.
+      stream = proxyRes.pipe(zlib.createBrotliDecompress());
+    } else if (encoding.includes('gzip') || encoding.includes('deflate')) {
+      // createUnzip auto-detects gzip vs deflate based on the buffer.
+      stream = proxyRes.pipe(zlib.createUnzip());
+    }
+    if (stream !== proxyRes) {
+      stream.on('error', (e) => {
+        console.error(`[proxy ${targetUrl.origin}] decompress error on ${req.path}:`, e.message);
+        if (!res.headersSent) res.end();
+        else res.end();
+      });
+    }
+
+    const chunks = [];
+    stream.on('data', (c) => chunks.push(c));
+    stream.on('end', () => {
+      try {
+        const buf = Buffer.concat(chunks);
+        let body = buf.toString('utf8');
+        body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
+        if (isHtml) {
+          body = injectIntoHtml(body, encoded, targetUrl.origin);
+        }
+        // Body changed: strip content-encoding (we decoded), recompute length.
+        try { res.removeHeader('content-encoding'); } catch (e) {}
+        const outBuf = Buffer.from(body, 'utf8');
+        try { res.setHeader('content-length', outBuf.length); } catch (e) {}
+        res.end(outBuf);
+      } catch (e) {
+        console.error(`[proxy ${targetUrl.origin}] rewrite error on ${req.path}:`, e.message);
+        if (!res.headersSent) {
+          res.statusCode = 502;
+          res.setHeader('content-type', 'text/plain');
+          res.end('Proxy rewrite error: ' + e.message);
+        } else {
+          res.end();
+        }
+      }
+    });
+    stream.on('error', (e) => {
+      console.error(`[proxy ${targetUrl.origin}] stream error on ${req.path}:`, e.message);
+      if (!res.headersSent) {
+        res.statusCode = 502;
+        res.setHeader('content-type', 'text/plain');
+        res.end('Proxy stream error: ' + e.message);
+      } else {
+        res.end();
+      }
+    });
+  };
+}
+
 function getOrCreateProxy(encoded) {
   if (proxyCache.has(encoded)) return proxyCache.get(encoded);
 
@@ -75,16 +274,14 @@ function getOrCreateProxy(encoded) {
     agent: isHttps ? httpsAgent : httpAgent,
 
     // Preserve the request path after stripping the /p/<encoded>/ prefix.
-    // Without this, the proxy would forward /p/<encoded>/api/foo to the
-    // target as /p/<encoded>/api/foo and the target would 404.
     pathRewrite: (p) => (p.startsWith(prefix) ? p.slice(prefix.length) || '/' : p),
 
-    // Tweak the outgoing request: replace the fingerprint, strip leaks,
-    // attach server-managed cookies, and rewrite Referer / Origin / Host.
     onProxyReq: (proxyReq, req, res) => {
-      // Cookies from our server-side jar (subdomain-aware).
+      // Cookies from our server-side jar (subdomain-aware). buildOutboundHeaders
+      // will also sync browser-sent cookies back into the jar so JS-set cookies
+      // flow through.
       const cookieHeader = cookies.get(targetUrl.hostname, req.path || '/', isHttps);
-      const headers = buildOutboundHeaders(req, targetUrl, prefix, cookieHeader);
+      const headers = buildOutboundHeaders(req, targetUrl, prefix, cookieHeader, cookies);
       for (const [k, v] of Object.entries(headers)) {
         try { proxyReq.setHeader(k, v); } catch (e) { /* some headers are read-only */ }
       }
@@ -95,130 +292,10 @@ function getOrCreateProxy(encoded) {
       }
     },
 
-    onProxyRes: responseInterceptor(async (buffer, proxyRes, req, res2) => {
-      // 1. Eat Set-Cookie: store into our server-side jar, then strip the
-      //    header from the response we forward to the browser. (The browser
-      //    would otherwise store cookies scoped to our domain, but that
-      //    doesn't help us -- we want them server-side so subdomain-aware
-      //    requests can see them.)
-      //
-      //    Exception: cookies whose names look like CSRF tokens (XSRF-TOKEN,
-      //    csrf_token, _csrf, etc.) ALSO get a duplicate Set-Cookie sent to
-      //    the browser, scoped to the proxy path /p/<encoded>/. Why: site JS
-      //    reads these cookies out of document.cookie and stuffs them into a
-      //    request header (X-XSRF-TOKEN, X-CSRF-Token, etc.). If we eat the
-      //    cookie, JS can't read it -> no header -> 403. Replit, lichess, and
-      //    most modern SPAs do this.
-      const setCookie = proxyRes.headers['set-cookie'];
-      if (setCookie) {
-        cookies.set(setCookie, targetUrl.hostname);
-        try { res2.removeHeader('set-cookie'); } catch (e) {}
-
-        // Forward CSRF-looking cookies to the browser. Rewrite the
-        // Set-Cookie attributes so the browser accepts them on our proxy
-        // host: drop Domain=, drop SameSite=None (broken on http), keep
-        // HttpOnly OFF so JS can read it, scope to /p/<encoded>/.
-        const isHttpsProxy = !!req.connection && req.connection.encrypted;
-        const passthrough = [];
-        for (const raw of setCookie) {
-          const nameMatch = raw.match(/^([^=;]+)/);
-          if (!nameMatch) continue;
-          const name = nameMatch[1].trim().toLowerCase();
-          const isCsrf = /csrf|xsrf|_token|token|nonce/i.test(name);
-          if (!isCsrf) continue;
-
-          let rewritten = raw
-            .replace(/;\s*Domain=[^;]+/gi, '')           // can't set Domain to target
-            .replace(/;\s*SameSite=[^;]+/gi, '')         // drop SameSite (default Lax on http)
-            .replace(/;\s*Secure/gi, '');                // drop Secure (broken on http proxy)
-          // Force HttpOnly off so JS can read document.cookie.
-          rewritten = rewritten.replace(/;\s*HttpOnly/gi, '');
-          // Scope to the proxy path so it doesn't leak across targets.
-          rewritten += '; Path=' + prefix + '/';
-          if (isHttpsProxy) rewritten += '; SameSite=None; Secure';
-          passthrough.push(rewritten);
-        }
-        if (passthrough.length) {
-          res2.setHeader('set-cookie', passthrough);
-        }
-      }
-
-      // 2. Strip headers that block our same-origin rewriting.
-      res2.removeHeader('content-security-policy');
-      res2.removeHeader('content-security-policy-report-only');
-      res2.removeHeader('x-frame-options');
-      res2.removeHeader('cross-origin-opener-policy');
-      res2.removeHeader('cross-origin-embedder-policy');
-      res2.removeHeader('cross-origin-resource-policy');
-      res2.removeHeader('permissions-policy');
-      res2.removeHeader('strict-transport-security');
-
-      // 2b. Rewrite redirect Location headers and other URL-bearing headers
-      //     so the browser stays inside the proxy. Without this, a 302 from
-      //     the target to itself (e.g. http://lichess.org -> https://lichess.org)
-      //     would send the browser out of the proxy entirely.
-      try {
-        const loc = proxyRes.headers['location'];
-        if (loc) {
-          const rewritten = rewriteSingleUrl(loc, targetUrl, req.headers.host);
-          if (rewritten !== loc) res2.setHeader('location', rewritten);
-        }
-      } catch (e) {}
-      try {
-        const refresh = proxyRes.headers['refresh'];
-        if (refresh) {
-          // Refresh: 5; url=https://lichess.org/foo
-          const rewritten = refresh.replace(
-            /url=(https?:\/\/(?:[a-zA-Z0-9-]+\.)*[^;]+)/i,
-            (m, u) => 'url=' + rewriteSingleUrl(u, targetUrl, req.headers.host)
-          );
-          if (rewritten !== refresh) res2.setHeader('refresh', rewritten);
-        }
-      } catch (e) {}
-      try {
-        const link = proxyRes.headers['link'];
-        if (link) {
-          // Link: <https://lichess.org/foo>; rel=preload, <https://socket.lichess.org/bar>; rel=preconnect
-          const rewritten = link.replace(
-            /<([^>]+)>/g,
-            (m, u) => '<' + rewriteSingleUrl(u, targetUrl, req.headers.host) + '>'
-          );
-          if (rewritten !== link) res2.setHeader('link', rewritten);
-        }
-      } catch (e) {}
-
-      const contentType = proxyRes.headers['content-type'] || '';
-      const isText =
-        contentType.includes('text/html') ||
-        contentType.includes('javascript') ||
-        contentType.includes('css') ||
-        contentType.includes('json') ||
-        contentType.includes('text/');
-
-      if (!isText) return buffer; // images, fonts, video, audio pass through.
-
-      // We're rewriting the body, so the original Content-Length (and any
-      // Content-Encoding the upstream server applied) is now wrong. HPM's
-      // responseInterceptor auto-decompresses gzip/deflate/br before calling
-      // us and removes the Content-Encoding header, but to be safe we strip
-      // both explicitly -- the response is rewritten and chunked out.
-      try { res2.removeHeader('content-encoding'); } catch (e) {}
-      try { res2.removeHeader('content-length'); } catch (e) {}
-
-      let text = buffer.toString('utf8');
-
-      // 3. Rewrite absolute / protocol-relative / ws(s) URLs in the body.
-      text = rewriteTextBody(text, targetUrl, req.headers.host);
-
-      // 4. For HTML, also inject the <base> tag + client-side patch script.
-      if (contentType.includes('text/html')) {
-        text = injectIntoHtml(text, encoded, targetUrl.origin);
-      }
-
-      return text;
-    }),
+    onProxyRes: makeOnProxyRes(targetUrl, encoded, prefix),
 
     onError: (err, req, res) => {
+      console.error(`[proxy ${targetUrl.origin}] error on ${req.path}:`, err.message);
       if (res && !res.headersSent) {
         res.status(502).json({ error: 'Proxy error', detail: err.message });
       }
@@ -231,10 +308,6 @@ function getOrCreateProxy(encoded) {
 }
 
 // --- throttling wrapper ---------------------------------------------
-// We can't put an async function into Express middleware chain directly
-// against the proxy, because http-proxy-middleware streams. Instead, we
-// wrap the proxy invocation: acquire the per-origin gate, forward, release
-// on response end (or error).
 function throttledProxy(entry, req, res, next) {
   const origin = entry.targetUrl.origin;
   let released = false;
@@ -290,7 +363,7 @@ const server = app.listen(PORT, () => {
   console.log(`Proxy server running at http://localhost:${PORT}`);
   console.log(`  UA: ${USER_AGENT}`);
   console.log(`  Throttle: max ${process.env.THROTTLE_MAX_CONCURRENT || 4} concurrent, ${process.env.THROTTLE_MIN_SPACING_MS || 180}ms min spacing per origin`);
-  console.log(`  Cookies: server-side jar (subdomain-aware)`);
+  console.log(`  Cookies: server-side jar (subdomain-aware) + browser mirror (all cookies)`);
 });
 
 // WebSocket upgrade requests bypass Express routing entirely; match the
@@ -303,7 +376,6 @@ server.on('upgrade', (req, socket, head) => {
   try { reqUrl = new URL(req.url, 'http://dummy'); }
   catch (err) { socket.destroy(); return; }
 
-  // Extract /p/<encoded>/... from the path.
   const m = reqUrl.pathname.match(/^\/p\/([^/]+)(.*)$/);
   if (!m) { socket.destroy(); return; }
   const encoded = m[1];
@@ -324,22 +396,25 @@ server.on('upgrade', (req, socket, head) => {
   try { entry = getOrCreateProxy(encoded); }
   catch (err) { socket.destroy(); return; }
 
-  // Strip leak headers on the upgrade too.
+  // Strip leak headers on the upgrade.
   for (const name of ['x-forwarded-for','x-forwarded-host','x-forwarded-proto','x-real-ip','via','forwarded','cf-connecting-ip','cf-ipcountry','cf-ray','cf-visitor']) {
     try { delete req.headers[name]; } catch (e) {}
   }
 
-  // Attach cookies for the WebSocket handshake (e.g. lichess session).
+  // Sync browser-sent cookies (if any) into the jar, then read jar cookies
+  // for the WS handshake. (The Cookie header on an upgrade is rare, but
+  // some clients do send it.)
+  if (req.headers.cookie) {
+    cookies.syncFromBrowser(req.headers.cookie, entry.targetUrl.hostname);
+  }
   const cookieHeader = cookies.get(entry.targetUrl.hostname, '/', entry.targetUrl.protocol === 'https:');
   if (cookieHeader) req.headers.cookie = cookieHeader;
 
   // Realistic UA on the WS handshake.
   req.headers['user-agent'] = USER_AGENT;
 
-  // Origin: for a same-origin WS (page origin == WS target origin) set it to
-  // the target origin so the request looks same-origin. For a cross-origin
-  // WS (e.g. lichess.org page -> socket3.lichess.org WS), use the page origin
-  // (lichess.org) — that's what the target's allowlist expects.
+  // Origin: same-origin -> target origin; cross-origin -> page origin
+  // (so the target's CORS allowlist matches).
   if (pageOrigin && pageOrigin !== entry.targetUrl.origin) {
     req.headers['origin'] = pageOrigin;
   } else {
