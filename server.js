@@ -19,7 +19,7 @@ const http = require('http');
 const https = require('https');
 const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 
-const { encodeOrigin, decodeOrigin, escapeRegex, rewriteTextBody, injectIntoHtml } = require('./lib/rewrite');
+const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, injectIntoHtml } = require('./lib/rewrite');
 const { buildOutboundHeaders, USER_AGENT } = require('./lib/fingerprint');
 const { gateFromEnv } = require('./lib/throttle');
 const { CookieJar } = require('./lib/cookieJar');
@@ -117,6 +117,40 @@ function getOrCreateProxy(encoded) {
       res2.removeHeader('permissions-policy');
       res2.removeHeader('strict-transport-security');
 
+      // 2b. Rewrite redirect Location headers and other URL-bearing headers
+      //     so the browser stays inside the proxy. Without this, a 302 from
+      //     the target to itself (e.g. http://lichess.org -> https://lichess.org)
+      //     would send the browser out of the proxy entirely.
+      try {
+        const loc = proxyRes.headers['location'];
+        if (loc) {
+          const rewritten = rewriteSingleUrl(loc, targetUrl, req.headers.host);
+          if (rewritten !== loc) res2.setHeader('location', rewritten);
+        }
+      } catch (e) {}
+      try {
+        const refresh = proxyRes.headers['refresh'];
+        if (refresh) {
+          // Refresh: 5; url=https://lichess.org/foo
+          const rewritten = refresh.replace(
+            /url=(https?:\/\/(?:[a-zA-Z0-9-]+\.)*[^;]+)/i,
+            (m, u) => 'url=' + rewriteSingleUrl(u, targetUrl, req.headers.host)
+          );
+          if (rewritten !== refresh) res2.setHeader('refresh', rewritten);
+        }
+      } catch (e) {}
+      try {
+        const link = proxyRes.headers['link'];
+        if (link) {
+          // Link: <https://lichess.org/foo>; rel=preload, <https://socket.lichess.org/bar>; rel=preconnect
+          const rewritten = link.replace(
+            /<([^>]+)>/g,
+            (m, u) => '<' + rewriteSingleUrl(u, targetUrl, req.headers.host) + '>'
+          );
+          if (rewritten !== link) res2.setHeader('link', rewritten);
+        }
+      } catch (e) {}
+
       const contentType = proxyRes.headers['content-type'] || '';
       const isText =
         contentType.includes('text/html') ||
@@ -126,6 +160,14 @@ function getOrCreateProxy(encoded) {
         contentType.includes('text/');
 
       if (!isText) return buffer; // images, fonts, video, audio pass through.
+
+      // We're rewriting the body, so the original Content-Length (and any
+      // Content-Encoding the upstream server applied) is now wrong. HPM's
+      // responseInterceptor auto-decompresses gzip/deflate/br before calling
+      // us and removes the Content-Encoding header, but to be safe we strip
+      // both explicitly -- the response is rewritten and chunked out.
+      try { res2.removeHeader('content-encoding'); } catch (e) {}
+      try { res2.removeHeader('content-length'); } catch (e) {}
 
       let text = buffer.toString('utf8');
 

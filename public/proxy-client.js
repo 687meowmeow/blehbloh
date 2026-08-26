@@ -88,7 +88,8 @@
     if (/^wss?:\/\//i.test(url)) {
       try {
         const proto = url.startsWith('wss') ? 'wss' : 'ws';
-        const u = new URL(url.replace(/^wss?:\/\//i, 'https://'));
+        const httpProto = proto === 'wss' ? 'https' : 'http';
+        const u = new URL(url.replace(/^wss?:\/\//i, httpProto + '://'));
         const apex = apexOf(u.hostname);
         if (apex === TARGET_APEX) {
           return `${proto}://${location.host}/p/${encodeOrigin(proto === 'wss' ? 'https://' + u.host : 'http://' + u.host)}${u.pathname}${u.search}${u.hash}`;
@@ -170,6 +171,44 @@
       try { url = rewriteUrl(String(url)); } catch (e) { /* keep */ }
       return origReplace(url);
     };
+  } catch (e) { /* ignore */ }
+
+  // --- WebSocket constructor -------------------------------------------
+  // Many sites (e.g. lichess) build the ws:// URL dynamically in JS, so the
+  // server-side HTML rewriter can't catch it. Patch the constructor.
+  try {
+    const OrigWebSocket = window.WebSocket;
+    function PatchedWebSocket(url, protocols) {
+      try {
+        if (typeof url === 'string') url = rewriteUrl(url);
+        else if (url && url.url) url = rewriteUrl(url.url);
+      } catch (e) { /* keep */ }
+      if (Array.isArray(protocols)) return new OrigWebSocket(url, ...protocols);
+      return new OrigWebSocket(url, protocols);
+    }
+    // Mirror static props + constants.
+    PatchedWebSocket.prototype = OrigWebSocket.prototype;
+    PatchedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+    PatchedWebSocket.OPEN = OrigWebSocket.OPEN;
+    PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING;
+    PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED;
+    window.WebSocket = PatchedWebSocket;
+  } catch (e) { /* ignore */ }
+
+  // --- EventSource (SSE) constructor ----------------------------------
+  try {
+    const OrigES = window.EventSource;
+    if (OrigES) {
+      function PatchedES(url, config) {
+        try { if (typeof url === 'string') url = rewriteUrl(url); } catch (e) { /* keep */ }
+        return new OrigES(url, config);
+      }
+      PatchedES.prototype = OrigES.prototype;
+      PatchedES.CONNECTING = OrigES.CONNECTING;
+      PatchedES.OPEN = OrigES.OPEN;
+      PatchedES.CLOSED = OrigES.CLOSED;
+      window.EventSource = PatchedES;
+    }
   } catch (e) { /* ignore */ }
 
   // --- Anchor interception --------------------------------------------

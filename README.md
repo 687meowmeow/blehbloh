@@ -98,6 +98,33 @@ blehbloh/
   normal web pages; for very large binary downloads this would be a
   memory hog (the original code has the same limitation).
 
+## Changelog
+
+### v2 (this update)
+- **Crash fix**: `throttle.release()` was calling `this._state.get()` on
+  what was actually a method, not the state Map. The first response
+  completion crashed the server. Fixed.
+- **`accept-encoding`**: dropped `zstd` (Node can't decode it natively).
+- **Location / Refresh / Link headers are now rewritten** so a target's
+  302 redirect (e.g. `http://lichess.org` → `https://lichess.org`) no
+  longer escapes the proxy.
+- **`WebSocket` and `EventSource` constructors patched client-side** so
+  sites that build their WS/SSE URLs dynamically in JS (lichess) stay
+  inside the proxy.
+- **`content-encoding` / `content-length` stripped from rewritten
+  responses** to avoid the client getting a decoded body with mismatched
+  headers.
+- **`apexOf` helper** in `lib/rewrite.js` for clean subdomain matching.
+
+### v1 (initial)
+- Realistic browser fingerprint (UA, sec-ch-ua, Sec-Fetch-*).
+- Server-side, subdomain-aware cookie jar.
+- Per-origin request throttle.
+- Subdomain-aware URL rewriting.
+- Client-side patches for history, fetch, XHR, window.open, location.
+- Proxy-leak header stripping.
+- WebSocket upgrade handshake fixups (UA, Origin, cookies).
+
 ## How to test against lichess
 
 1. `npm install && npm start`
