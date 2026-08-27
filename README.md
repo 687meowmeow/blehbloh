@@ -100,75 +100,115 @@ blehbloh/
 
 ## Changelog
 
-### v6 (this update — JS AST rewriter + location emulation)
-This is the big architectural fix that production proxies (Ultraviolet,
-Corrosion) have and we didn't. Replit was uninteractable and lichess's
-center panel was missing because the JS AST rewriter was missing.
+### v10 (this update — worker bootstrap + UV-parity patches)
+Audited Ultraviolet's source (`/tmp/uv-core/`) and found 12 more patches +
+the worker bootstrap system that UV has and we didn't. All implemented.
 
-- **JS AST rewriter** (`lib/jsRewrite.js`): parses every JS bundle with
-  acorn, walks the AST, and rewrites reads/writes of `location`,
-  `parent`, `top` to go through `$proxyGet$` / `$proxySet$` globals
-  that return an emulated location object. `location.href` becomes
-  `$proxyGet$(window, "location").href`. `window.location = "/foo"`
-  becomes `$proxySet$(window, "location", "/foo", "=")`. Object keys,
-  function params, var declarations, and member accesses on non-
-  window objects are correctly NOT rewritten. Function/arrow/destructuring
-  param shadowing is handled by a scope-tracking first pass.
-- **Location emulation** (in `public/proxy-client.js`): a plain
-  object with `href`/`origin`/`pathname`/etc. getters that return the
-  TARGET's URL parts (parsed by unwrapping the proxy prefix from the
-  real `location.href`). Setters navigate via `window.location.href =
-  rewriteUrl(...)`. This is what `$proxyGet$(window, "location")`
-  returns to the page's JS.
-- **`$proxyGet$`/`$proxySet$`/`$proxyCall$m` globals** installed on
-  `window`. `$proxyGet$(window, "location")` returns the location
-  emulation; `$proxySet$(window, "location", "url", "=")` navigates via
-  the proxy; other reads/writes fall through to the real property.
-- **`history.pushState`/`replaceState` now call `updateLocationEmulation`
-  after** so that subsequent reads of `location.pathname` reflect the
-  new path. SPA routers (Next.js `useRouter`, scalajs-react) read
-  `location.pathname` to determine which route to render.
-- **`popstate` listener** updates the emulation on back/forward.
-- **`document.URL` / `documentURI` overrides** return the target's URL
-  (was returning the proxy URL).
-- **`Node.prototype.baseURI` override** returns the target origin.
-- **`window.origin` override** (window.origin IS configurable, unlike
-  window.location).
-- **Anchor click handler removed.** The capture-phase click listener
-  was desyncing React 18's synthetic event system (it walks the DOM
-  during the click handler and gets confused if attributes change
-  mid-event). Replaced with `HTMLAnchorElement.prototype.href` descriptor
-  override + sidecar attribute pattern (`__proxy-href`): when JS sets
-  `el.href = "/foo"`, we stash `/foo` under `__proxy-href` and set the
-  actual href to `rewriteUrl("/foo")`. `getAttribute('href')` returns
-  the sidecar; the browser navigates the proxied URL. This is the
-  pattern Corrosion uses.
-- **Inline `<script>` blocks** now get the JS AST rewriter applied
-  (was only being applied to external .js files).
-- **Absolute https?:// URLs in inline scripts are NO LONGER rewritten**
-  (only absolute paths /foo are). This preserves origin string
-  comparisons like `if (location.origin === "https://replit.com")`
-  — both sides now read the same target origin. The client-side
-  `fetch()`/`XHR` patches catch URLs used as fetch arguments at runtime.
+- **Worker bootstrap system** (the biggest gap): server detects worker
+  requests via `Sec-Fetch-Dest: worker / shared-worker / service-worker /
+  audio-worklet / paint-worklet` and prepends a bootstrap that calls
+  `importScripts('/proxy-worker-bootstrap.js')` and sets
+  `self.__proxyWorkerConfig`. The bootstrap patches the worker's
+  `self.fetch`, `XMLHttpRequest.open`, `self.importScripts`, `self.WebSocket`,
+  `self.EventSource`, and `self.WorkerLocation` so the worker's
+  `fetch('/api/foo')` goes through the proxy instead of 404ing on the
+  proxy origin. Without this, any site that uses workers for non-trivial
+  work (lichess chess engine, Firebase auth workers, monaco-editor,
+  Figma, code sandbox) silently breaks.
+- **`DOMParser.prototype.parseFromString`** override: rewrites URLs in
+  HTML strings parsed by `new DOMParser().parseFromString(htmlStr, 'text/html')`.
+  React's component testing utilities and Apollo's link parser use this.
+- **`new Function("...")` override**: rewrites URL strings in the body
+  so `new Function("return fetch('/foo')")()` works through the proxy.
+  Catches eval-based template compilers (Vue 2 template compiler).
+- **`window.eval` override**: rewrites URL strings in the eval body.
+  Catches `eval("fetch('/api/x')")`.
+- **`Function.prototype.toString` anti-detection**: returns
+  `"function () { [native code] }"` for all our patched functions so
+  sites' native-code checks (`fn.toString().includes('native code')`)
+  pass. Uses a `WeakSet` of patched functions to identify them.
+- **`Object.getOwnPropertyNames` / `getOwnPropertyDescriptors`** overrides:
+  hide our `__proxy-*` sidecar attributes from code that enumerates
+  element properties. Otherwise libraries that diff DOM state (React
+  fiber, Vue reactivity) would see them and may break.
+- **`HTMLAnchorElement.prototype.protocol/host/hostname/port/pathname/
+  search/hash` descriptor overrides**: these have their own descriptors
+  that returned the proxy host. Now they return the target host
+  (parsed from the sidecar href or unwrapped from the actual href).
+  Sites that do `if (a.hostname === "lichess.org")` now succeed.
+- **`Worklet.prototype.addModule` override**: rewrites the script URL
+  for AudioWorklets / PaintWorklets / AnimationWorklets.
+- **`URL.createObjectURL` / `revokeObjectURL`**: documented as no-op
+  (blob URLs don't need rewriting themselves; the `Worker` constructor
+  patch handles blob workers).
+- **Server `__porigin` query param stripping** for ALL HTTP requests
+  (was only WS upgrades): strict targets that validate query params
+  were rejecting `?__porigin=<encoded>`.
+- **Server `Set-Cookie Path=` stripping**: now strips the original
+  `Path=/dashboard` before adding our `Path=/p/<encoded>/`. Prevents
+  duplicate Path attributes.
+
+### v9
+- Server strips `integrity` and `nonce` from `<script>`/`<link>` tags.
+- Server strips original `Path=` from Set-Cookie.
+- Server strips `__porigin` from ALL HTTP requests.
+- Server rewrites `<iframe srcdoc="...">` inline HTML.
+- Server rewrites CSS `@import` rules.
+- `Element.prototype.setAttribute` "delete route" for integrity/nonce/CSP.
+- `Element.prototype.setAttributeNS` (SVG `xlink:href`).
+- `Element.prototype.insertAdjacentHTML` (jQuery, Svelte, etc.).
+- `Element.prototype.cloneNode` (re-stash sidecars on deep clones).
+- `Element.prototype.getAttribute` handles ALL `__proxy-*` sidecars (case-insensitive).
+- `window.URL` constructor + `URL.canParse` overrides.
+- `Response.url` / `Request.url` / `XHR.responseURL` getter overrides.
+- `navigator.sendBeacon` override.
+- `Audio` constructor override.
+- `CSSStyleSheet.insertRule` / `replaceSync` overrides.
+- `document.referrer` override.
+- `$proxySet$` compound assignment on `location` fixed.
+- `$proxyCall$m` no longer swallows errors.
+- `window.postMessage` uses proxy origin.
+- MutationObserver watches `attributes` + walks Shadow DOM.
+- `ORIG` reference object avoids recursion.
+
+### v8
+- HTML element descriptor overrides for ALL URL-bearing properties.
+- `Element.prototype.setAttribute` for ALL URL attribute names.
+- `Element.prototype.innerHTML` / `outerHTML`.
+- `Document.prototype.write` / `writeln`.
+- `window.postMessage` (rewrites targetOrigin).
+- `MessageEvent.prototype.origin`.
+- `document.domain`.
+- `CSSStyleDeclaration.setProperty` + descriptors.
+- `Worker` / `SharedWorker` constructors.
+- `navigator.serviceWorker.register`.
+- `localStorage` / `sessionStorage` per-origin namespacing.
+
+### v7
+- New `rewriteJsonBody` for JSON content.
+- `type="application/json"` inline scripts (e.g. `__NEXT_DATA__`).
+- `crossorigin="use-credentials"` stripped from manifest/icon links.
+
+### v6
+- JS AST rewriter (`lib/jsRewrite.js`).
+- Location emulation in `public/proxy-client.js`.
+- `history.pushState`/`replaceState` call `updateLocationEmulation`.
+- `document.URL`/`documentURI`/`baseURI`/`window.origin` overrides.
+- Anchor click handler removed (was desyncing React 18).
+- Inline `<script>` blocks get the JS AST rewriter applied.
+- Absolute `https?://` URLs in inline scripts NOT rewritten.
 
 ### v5
-- Double-prefix bug on cross-origin absolute URLs (the Replit killer):
-  `<script src="https://cdn.replit.com/_next/foo.js">` was getting
-  `/p/<enc-replit>/p/<enc-cdn>/_next/foo.js`. Fixed.
-- `<meta http-equiv="Content-Security-Policy">` stripped (the Lichess
-  killer): CSP path-matching rejected the proxied WS URLs.
-- CSS `url('/foo')` rewriter added for text/css + inline `<style>`.
-- Cross-apex origins proxied: lichess1.org, cdn.replit.com,
-  identitytoolkit.googleapis.com (Firebase) all get their own encoded
-  prefix. Replaces the old "only match target eTLD+1" logic.
-- srcset/imagesrcset handled separately with descriptor-aware splitter
-  (Cloudflare's cdn-cgi/image URLs contain commas).
-- SVG `<use>`/`<image>`/`xlink:href`, meta refresh, `data-bg`/
-  `data-original`/`data-lazy-src`, inline `style="url(...)"` attributes.
+- Double-prefix bug on cross-origin absolute URLs (Replit killer).
+- `<meta http-equiv="Content-Security-Policy">` stripped (Lichess killer).
+- CSS `url('/foo')` rewriter.
+- Cross-apex origins proxied (lichess1.org, cdn.replit.com, identitytoolkit).
+- srcset/imagesrcset descriptor-aware splitter.
+- SVG `<use>`/`<image>`/`xlink:href`, meta refresh, data-bg/data-original.
 
 ### v4
-- Streaming responses no longer buffered (custom `onProxyRes`).
-- Broton decompression fixed (`createBrotliDecompress`).
+- Streaming responses no longer buffered.
+- Broton decompression fixed.
 - ALL cookies mirrored to browser.
 - Browser-set cookies sync back to server jar.
 - Hostname regex hardened.

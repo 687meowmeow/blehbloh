@@ -20,7 +20,7 @@ const https = require('https');
 const zlib = require('zlib');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
-const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, rewriteCssUrls, rewriteSrcsetValue, injectIntoHtml } = require('./lib/rewrite');
+const { encodeOrigin, decodeOrigin, escapeRegex, rewriteSingleUrl, rewriteTextBody, rewriteCssUrls, rewriteSrcsetValue, rewriteJsonBody, injectIntoHtml } = require('./lib/rewrite');
 const { rewriteJs } = require('./lib/jsRewrite');
 const { buildOutboundHeaders, USER_AGENT } = require('./lib/fingerprint');
 const { gateFromEnv } = require('./lib/throttle');
@@ -113,7 +113,8 @@ function mirrorSetCookie(raw, prefix, isHttpsProxy) {
     .replace(/;\s*Domain=[^;]+/gi, '')
     .replace(/;\s*SameSite=[^;]+/gi, '')
     .replace(/;\s*Secure/gi, '')
-    .replace(/;\s*HttpOnly/gi, '');
+    .replace(/;\s*HttpOnly/gi, '')
+    .replace(/;\s*Path=[^;]+/gi, '');  // strip original Path — we'll set our own
   rewritten += '; Path=' + prefix + '/';
   if (isHttpsProxy) rewritten += '; SameSite=None; Secure';
   return rewritten;
@@ -236,18 +237,17 @@ function makeOnProxyRes(targetUrl, encoded, prefix) {
           // <script> blocks (location/parent/top reads/writes).
           body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
           body = injectIntoHtml(body, encoded, targetUrl.origin);
-          // Run JS AST rewriter on inline <script> blocks.
+          // Run JS AST rewriter on inline <script> blocks (only JS-typed
+          // scripts; JSON/template scripts are already handled by the
+          // rewriteJsonBody call inside rewriteTextBody).
           body = body.replace(/<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi, (m, attrs, content) => {
             // Skip if the script has a src= attribute (external script).
             if (/\bsrc\s*=/i.test(attrs || '')) return m;
-            // Skip non-JS scripts.
+            // Only run on JS scripts.
             const typeMatch = (attrs || '').match(/type\s*=\s*["']([^"']*)["']/i);
-            if (typeMatch) {
-              const t = typeMatch[1].toLowerCase();
-              if (t && t !== 'text/javascript' && t !== 'application/javascript' && t !== 'module' && t !== 'application/ecmascript' && t !== 'text/ecmascript') {
-                return m;
-              }
-            }
+            const t = typeMatch ? typeMatch[1].toLowerCase() : 'text/javascript';
+            const isJs = ['text/javascript', 'application/javascript', 'module', 'application/ecmascript', 'text/ecmascript'].includes(t);
+            if (!isJs) return m;
             const rewritten = rewriteJs(content);
             if (rewritten && rewritten !== content) {
               return `<script${attrs || ''}>${rewritten}</script>`;
@@ -268,9 +268,39 @@ function makeOnProxyRes(targetUrl, encoded, prefix) {
           if (astRewritten && astRewritten !== body) {
             body = astRewritten;
           }
+
+          // Worker bootstrap: if this is a worker script (Sec-Fetch-Dest:
+          // worker / shared-worker / service-worker / audio-worklet /
+          // paint-worklet), prepend a bootstrap that loads
+          // proxy-worker-bootstrap.js via importScripts and sets the
+          // config. Without this, the worker's self.fetch,
+          // self.importScripts, self.WebSocket, etc. would be un-patched
+          // and the worker's fetch('/api/foo') would 404 on the proxy
+          // origin.
+          //
+          // We also detect blob: workers — main-thread code that does
+          // `new Worker(URL.createObjectURL(blob))` won't have a
+          // Sec-Fetch-Dest header for the worker script (it's a blob: URL).
+          // The client-side Worker constructor patch (in proxy-client.js)
+          // rewrites blob worker source before creating the blob URL.
+          const fetchDest = (req.headers['sec-fetch-dest'] || '').toLowerCase();
+          const isWorkerDest = ['worker', 'shared-worker', 'service-worker', 'audio-worklet', 'paint-worklet'].includes(fetchDest);
+          if (isWorkerDest) {
+            const proxyHost = req.headers.host;
+            const bootstrap =
+              `if(!self.__proxyBootstrapInstalled){` +
+              `self.__proxyWorkerConfig={targetOrigin:${JSON.stringify(targetUrl.origin)},` +
+              `encoded:${JSON.stringify(encoded)},prefix:${JSON.stringify(prefix)},` +
+              `proxyHost:${JSON.stringify(proxyHost)}};` +
+              `importScripts('/proxy-worker-bootstrap.js');` +
+              `}`;
+            body = bootstrap + '\n' + body;
+          }
         } else {
-          // JSON / other text: rewrite absolute URLs only.
-          body = rewriteTextBody(body, targetUrl, req.headers.host, encoded);
+          // JSON / other text: use the JSON-aware rewriter (rewrites
+          // absolute paths /foo and absolute URLs https://host inside
+          // JSON string values).
+          body = rewriteJsonBody(body, targetUrl, req.headers.host, encoded);
         }
         // Body changed: strip content-encoding (we decoded), recompute length.
         try { res.removeHeader('content-encoding'); } catch (e) {}
@@ -321,6 +351,19 @@ function getOrCreateProxy(encoded) {
     pathRewrite: (p) => (p.startsWith(prefix) ? p.slice(prefix.length) || '/' : p),
 
     onProxyReq: (proxyReq, req, res) => {
+      // Strip the `__porigin` query param (added by client-side
+      // WebSocket/EventSource patches) so it doesn't leak to the target.
+      // Without this, the target sees `?__porigin=<encoded>` in the URL
+      // and strict targets (or those with query-param validators) reject it.
+      try {
+        if (proxyReq.path && proxyReq.path.indexOf('__porigin=') >= 0) {
+          const stripped = proxyReq.path
+            .replace(/[?&]__porigin=[^&]*/g, '')
+            .replace(/\?$/, '');
+          proxyReq.path = stripped;
+        }
+      } catch (e) { /* ignore */ }
+
       // Cookies from our server-side jar (subdomain-aware). buildOutboundHeaders
       // will also sync browser-sent cookies back into the jar so JS-set cookies
       // flow through.
